@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cochl-sense-cloud-live-demo-backend"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "cochl>=0.2.1",
+  "fastapi>=0.115.0",
+  "pydantic>=2.7.0",
+  "python-dotenv>=1.0.1",
+  "python-multipart>=0.0.9",
+  "starlette>=1.3.1",
+  "uvicorn[standard]>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.27.0",
+  "pytest>=8.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["backend*"]
+
+[tool.pytest.ini_options]
+pythonpath = [".."]
+testpaths = ["tests"]
