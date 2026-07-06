@@ -6,6 +6,7 @@ import type { LiveAudioCaptureOptions, LiveAudioWindow, LiveSpectrogramFrame } f
 const appMocks = vi.hoisted(() => ({
   analyzeRecording: vi.fn(),
   analyzeLiveChunk: vi.fn(),
+  endLiveSession: vi.fn(),
   createLiveAudioCapture: vi.fn(),
   liveWindowCallbacks: [] as Array<(window: LiveAudioWindow) => void>,
   liveSpectrogramCallbacks: [] as Array<(frame: LiveSpectrogramFrame) => void>,
@@ -15,6 +16,7 @@ const appMocks = vi.hoisted(() => ({
 vi.mock('./api', () => ({
   analyzeRecording: appMocks.analyzeRecording,
   analyzeLiveChunk: appMocks.analyzeLiveChunk,
+  endLiveSession: appMocks.endLiveSession,
 }));
 
 vi.mock('./liveAudio', async (importOriginal) => {
@@ -31,6 +33,7 @@ import type { AnalysisResponse, LiveChunkAnalysisResponse, SoundEvent } from './
 beforeEach(() => {
   appMocks.analyzeRecording.mockReset();
   appMocks.analyzeLiveChunk.mockReset();
+  appMocks.endLiveSession.mockReset();
   appMocks.createLiveAudioCapture.mockReset();
   appMocks.liveWindowCallbacks = [];
   appMocks.liveSpectrogramCallbacks = [];
@@ -42,6 +45,15 @@ beforeEach(() => {
     sound_events: [],
     processing_time_ms: 1,
   });
+  appMocks.endLiveSession.mockImplementation(async (sessionId: string) => ({
+    session_id: sessionId,
+    segment_count: 0,
+    total_collected_duration_sec: 0,
+    kept_chunk_count: 0,
+    discarded_silent_chunk_count: 0,
+    discarded_speech_chunk_count: 0,
+    segments: [],
+  }));
   appMocks.createLiveAudioCapture.mockImplementation((_stream, onWindow, options?: LiveAudioCaptureOptions) => {
     appMocks.liveWindowCallbacks.push(onWindow);
     if (options?.onSpectrogramFrame) {
@@ -283,6 +295,109 @@ describe('App', () => {
 
       expect(appMocks.liveCleanups[0]).toHaveBeenCalled();
       expect(recording.stoppedTrack.stop).toHaveBeenCalled();
+    } finally {
+      recording.restore();
+    }
+  });
+
+  it('shows live collection counts from chunk collection statuses', async () => {
+    const recording = installRecordingEnvironment();
+    appMocks.analyzeLiveChunk
+      .mockResolvedValueOnce({
+        ...liveResponse(1, [{ label: 'Knock', confidence: 0.9 }]),
+        collection_status: 'collected',
+      })
+      .mockResolvedValueOnce({
+        ...liveResponse(2, []),
+        collection_status: 'discarded_silent',
+      })
+      .mockResolvedValueOnce({
+        ...liveResponse(3, [{ label: 'Speech', confidence: 0.9 }]),
+        collection_status: 'discarded_speech',
+      });
+
+    try {
+      render(<App />);
+      await userEvent.click(screen.getByRole('button', { name: /녹음 시작/i }));
+      await screen.findByText(/녹음 중/i);
+
+      await act(async () => {
+        appMocks.liveWindowCallbacks[0](liveWindow(0, 2));
+        appMocks.liveWindowCallbacks[0](liveWindow(1, 3));
+        appMocks.liveWindowCallbacks[0](liveWindow(2, 4));
+      });
+
+      expect(
+        await screen.findByText(/수집 1 · 무음 제외 1 · 음성 제외 1/),
+      ).toBeInTheDocument();
+    } finally {
+      recording.restore();
+    }
+  });
+
+  it('ends the live session and shows the collection summary after 완료', async () => {
+    const recording = installRecordingEnvironment();
+    appMocks.endLiveSession.mockImplementation(async (sessionId: string) => ({
+      session_id: sessionId,
+      segment_count: 2,
+      total_collected_duration_sec: 17.5,
+      kept_chunk_count: 12,
+      discarded_silent_chunk_count: 4,
+      discarded_speech_chunk_count: 3,
+      segments: [
+        {
+          segment_index: 1,
+          start_sec: 0,
+          end_sec: 12,
+          duration_sec: 12,
+          event_count: 5,
+          labels: ['Knock', 'Keyboard'],
+          audio_filename: 'segment-001-0.000-12.000.wav',
+          metadata_filename: 'segment-001-0.000-12.000.json',
+        },
+        {
+          segment_index: 2,
+          start_sec: 20,
+          end_sec: 25.5,
+          duration_sec: 5.5,
+          event_count: 2,
+          labels: ['Glass_break'],
+          audio_filename: 'segment-002-20.000-25.500.wav',
+          metadata_filename: 'segment-002-20.000-25.500.json',
+        },
+      ],
+    }));
+
+    try {
+      render(<App />);
+      await userEvent.click(screen.getByRole('button', { name: /녹음 시작/i }));
+      await screen.findByText(/녹음 중/i);
+
+      await userEvent.click(screen.getByRole('button', { name: /완료/i }));
+
+      expect(appMocks.endLiveSession).toHaveBeenCalledTimes(1);
+      expect(String(appMocks.endLiveSession.mock.calls[0][0])).toMatch(/^session-/);
+      expect(await screen.findByText(/데이터 수집 결과/)).toBeInTheDocument();
+      expect(screen.getByText(/세그먼트 2개 · 총 17.5초 저장/)).toBeInTheDocument();
+      expect(screen.getByText(/Knock, Keyboard/)).toBeInTheDocument();
+      expect(screen.getByText(/Glass_break/)).toBeInTheDocument();
+    } finally {
+      recording.restore();
+    }
+  });
+
+  it('ends the live session without showing a summary when the recording is discarded', async () => {
+    const recording = installRecordingEnvironment();
+
+    try {
+      render(<App />);
+      await userEvent.click(screen.getByRole('button', { name: /녹음 시작/i }));
+      await screen.findByText(/녹음 중/i);
+
+      await userEvent.click(screen.getByRole('button', { name: /폐기/i }));
+
+      await waitFor(() => expect(appMocks.endLiveSession).toHaveBeenCalledTimes(1));
+      expect(screen.queryByText(/데이터 수집 결과/)).not.toBeInTheDocument();
     } finally {
       recording.restore();
     }

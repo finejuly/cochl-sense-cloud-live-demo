@@ -803,3 +803,78 @@ h3 {
     display: grid;
   }
 }
+
+.collection-summary {
+  border: 1px solid #d8e0dd;
+  border-radius: 8px;
+  margin-top: 16px;
+  padding: 18px 20px;
+  background: #ffffff;
+}
+
+.collection-summary-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #0f5f59;
+}
+
+.collection-summary-header h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.collection-summary-stats {
+  margin: 10px 0 0;
+  color: #52615d;
+  font-size: 0.92rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.collection-segment-list {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.collection-segment-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  border: 1px solid #d7e2dd;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #f9fbfa;
+  font-size: 0.92rem;
+}
+
+.collection-segment-index {
+  color: #0f5f59;
+  font-weight: 720;
+}
+
+.collection-segment-range {
+  color: #52615d;
+  font-variant-numeric: tabular-nums;
+}
+
+.collection-segment-labels {
+  color: #083f3b;
+  font-weight: 600;
+}
+
+.collection-summary-empty {
+  margin: 12px 0 0;
+  color: #5d6a67;
+  font-size: 0.92rem;
+}
+
+.collection-summary-note {
+  margin: 12px 0 0;
+  color: #7a8683;
+  font-size: 0.85rem;
+  word-break: break-all;
+}

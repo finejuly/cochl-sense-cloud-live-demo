@@ -1,0 +1,92 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Overview
+
+A local demo app for streaming microphone audio to the Cochl.Sense Cloud API and monitoring live sound-event results. The browser records mic input, sends short live WAV chunks to a FastAPI backend (which proxies to Cochl.Sense Cloud), and renders detected events, a live spectrogram, per-chunk request states, and latency metrics in a React dashboard.
+
+Three deployables share one repo: `backend/` (FastAPI proxy), `frontend/` (React + Vite dashboard), and `macos/` (a native Objective-C WKWebView shell that launches the backend and points a window at it).
+
+## Commands
+
+Backend setup (run from repo root; note the specific interpreter and editable install):
+
+```bash
+/opt/homebrew/bin/python3.11 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e "backend[dev]"
+cp .env.example .env   # then set COCHL_PROJECT_KEY
+```
+
+Run locally (two processes):
+
+```bash
+.venv/bin/uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+cd frontend && nvm use && npm install && npm run dev   # Vite proxies /api -> :8000
+```
+
+Tests and build:
+
+```bash
+.venv/bin/python -m pytest backend/tests -v          # all backend tests
+.venv/bin/python -m pytest backend/tests/test_api.py::<name> -v   # single test
+cd frontend && npm test               # vitest watch
+cd frontend && npm test -- --run      # vitest once (CI)
+cd frontend && npm test -- --run src/liveTimeline.test.ts   # single file
+cd frontend && npm run build          # tsc -b && vite build -> frontend/dist
+```
+
+macOS app (requires Xcode Command Line Tools; build script runs `npm run build` first):
+
+```bash
+scripts/build-macos-app.sh && open CochlSenseCloudLiveDemo.app
+```
+
+## Architecture
+
+### Two analysis paths
+
+The app has two distinct request flows against Cochl, and changes usually need to touch both consistently:
+
+- **Live chunking** (`POST /api/analyze-live-chunk`): the primary feature. While recording, the frontend synthesizes 2-second WAV windows (1-second hop) via Web Audio and posts them once per second. Only sound event detection runs for live chunks (`CochlProvider.analyze_live_chunk` hardcodes SED-only regardless of settings). Sound-event timestamps are offset by `window_start_sec` so they land on the correct point of the global timeline.
+- **Full recording** (`POST /api/analyze-recording`): after recording stops, the complete file is analyzed once. This path respects the enabled-services config (SED / speech analysis / audio insights) and returns the full `AnalysisResponse`.
+
+### Live data collection
+
+By default (`COCHL_COLLECTION_ENABLED=true`), analyzed live chunks flow into `collection.py` instead of being kept as per-chunk debug MP3s. `SegmentCollector` classifies each chunk (`collected` / `discarded_silent` / `discarded_speech`), deletes discards, and merges kept chunks — trimming the 1-second window overlap — into contiguous WAV segments of at most `COCHL_COLLECTION_MAX_SEGMENT_SEC` (20 s) under `recordings/collected/<session-id>/`, each with a metadata JSON. Key invariants:
+
+- **Privacy first**: any event whose label matches `COCHL_COLLECTION_EXCLUDE_LABEL_KEYWORDS` (case-insensitive substring, e.g. `Male_speech`) discards the chunk regardless of other events, and forces a segment split so no collected file spans a speech region.
+- **Out-of-order tolerance**: chunk analyses complete out of order (up to `LIVE_MAX_IN_FLIGHT` concurrent), so entries sit in a reorder buffer and are only folded into segments once the watermark (max window end seen − `reorder_hold_back_sec`) passes them. `POST /api/live-session/end` (called by the frontend on 완료/폐기/unmount) flushes everything and returns a `LiveSessionEndResponse` summary.
+- Collection failures must never fail the analyze response — the route wraps collection in try/except and returns `collection_status: null`.
+- `LiveCollectionManager` (one per app, on `app.state`) keys collectors by *sanitized* session id (`saved_path.parent.name`) and finalizes stale sessions opportunistically.
+
+### Backend (`backend/app/`)
+
+- `main.py` — `create_app()` factory wires routes and app state, and (when `frontend/dist` exists) serves the built SPA with a path-traversal-guarded catch-all. Live chunks are (1) rate-limited to `LIVE_PROVIDER_MAX_CONCURRENCY=10` concurrent Cochl calls via an anyio `CapacityLimiter`, and (2) after analysis, routed into the collection pipeline (or, with collection disabled, converted to MP3 **asynchronously** on a bounded `ThreadPoolExecutor`: `LIVE_CONVERSION_MAX_WORKERS=2`, drop when `>= LIVE_CONVERSION_MAX_PENDING=32` pending; finalized collection segments reuse the same executor). Blocking Cochl SDK calls run via `run_in_threadpool`.
+- `collection.py` — the live data-collection pipeline (see above). Pure stdlib (`wave`), no Cochl SDK; thread-safe via per-collector locks.
+- `cochl_provider.py` — the only module that imports the `cochl` SDK (imported lazily inside methods so tests can run without it). Submits a file, extracts a `job_id`, and polls `get_completed_result`. Tests inject a fake provider through `app.state.provider_factory`.
+- `config.py` — frozen `Settings` dataclass loaded from env via `Settings.from_env()`. `get_settings()` in `main.py` is `lru_cache`d, so **env changes require a process restart**. `validate_service_combination` enforces that audio insights requires both SED and speech analysis.
+- `normalization.py` — defensively maps Cochl's raw (and variably-keyed) JSON into the typed response models. It tolerates alternate field names (`start_time_sec`/`start`, `class`/`label`/`name`, etc.) via `_first_present` — preserve this leniency when editing.
+- `audio.py` — content-type/extension mapping, upload size validation, and `ffmpeg` shelling for WAV/MP3 conversion. If a browser recording isn't a Cochl-supported format (e.g. WebM), `prepare_audio_for_cochl` converts it to 16 kHz mono WAV; missing `ffmpeg` raises `AudioConversionError` (surfaced as HTTP 415).
+- `models.py` — Pydantic response models (`AnalysisResponse`, `LiveChunkAnalysisResponse`, `SoundEvent`, etc.).
+
+Full recordings persist to `recordings/`. With collection enabled (default), meaningful live audio ends up in `recordings/collected/<session-id>/` and discarded chunks are deleted; with it disabled, every live chunk is kept under `recordings/live/<session-id>/` as MP3. Nothing else is auto-deleted.
+
+### Frontend (`frontend/src/`)
+
+`App.tsx` is the large orchestrator; most logic lives in small, individually-tested pure modules:
+
+- `liveAudio.ts` — `LiveWindowBuffer` slices the mic stream into overlapping windows; `createLiveAudioCapture` wires the Web Audio graph and emits both windows and spectrogram frames; `encodePcm16Wav` builds the WAV blob sent to the backend.
+- `liveChunkRecords.ts` — the per-chunk state machine. Each chunk is `PENDING | DETECTED | EMPTY | FAIL | SKIP` and carries latency fields; also derives the render geometry for the chunk timeline.
+- `liveTimeline.ts` — merges/lays out detected events into lanes and manages the scrolling viewport.
+- `api.ts` — the three fetch calls (`analyzeRecording`, `analyzeLiveChunk`, `endLiveSession`); error bodies are read from `{ detail }`. **User-facing strings are Korean** — match that when adding UI copy.
+- `LiveSpectrogramPanel.tsx`, `waveform.ts`, `recorder.ts`, `audioContext.ts` — canvas rendering, waveform helpers, MediaRecorder wrapper, cross-browser AudioContext lookup.
+
+**Frontend backpressure**: `handleLiveWindow` tracks in-flight requests in `liveInFlightRef` and drops a window as `SKIP` once `LIVE_MAX_IN_FLIGHT` is reached, rather than queuing. A `liveSessionTokenRef` guards every async continuation so stale responses from a previous recording are ignored. This is deliberate — keep new async live-path work token-guarded.
+
+## Conventions
+
+- Backend: `from __future__ import annotations`, dataclasses, and thorough test coverage per module. New Cochl-response fields go through `normalization.py`, never parsed inline in routes.
+- The `cochl` SDK is imported lazily only in `cochl_provider.py`; keep it out of other modules so tests and normalization stay SDK-free.
+- Node version: `scripts/build-macos-app.sh` pins node `v24.14.0` and `.nvmrc` is `24.14.0`, while `package.json` engines and the README state `>=20.19`. Use `nvm use` to match `.nvmrc`.

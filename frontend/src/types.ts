@@ -41,10 +41,34 @@ export interface AnalysisResponse {
   usage: UsageMetadata;
 }
 
+export type LiveChunkCollectionStatus = 'collected' | 'discarded_silent' | 'discarded_speech';
+
 export interface LiveChunkAnalysisResponse {
   sequence_id: number;
   window_start_sec: number;
   window_end_sec: number;
   sound_events: SoundEvent[];
   processing_time_ms: number;
+  collection_status?: LiveChunkCollectionStatus | null;
+}
+
+export interface CollectedSegmentSummary {
+  segment_index: number;
+  start_sec: number;
+  end_sec: number;
+  duration_sec: number;
+  event_count: number;
+  labels: string[];
+  audio_filename: string;
+  metadata_filename: string;
+}
+
+export interface LiveSessionEndResponse {
+  session_id: string;
+  segment_count: number;
+  total_collected_duration_sec: number;
+  kept_chunk_count: number;
+  discarded_silent_chunk_count: number;
+  discarded_speech_chunk_count: number;
+  segments: CollectedSegmentSummary[];
 }

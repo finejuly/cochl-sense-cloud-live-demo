@@ -24,8 +24,14 @@ from backend.app.audio import (
     validate_upload_size,
 )
 from backend.app.cochl_provider import CochlProvider
+from backend.app.collection import LiveCollectionManager, policy_from_settings
 from backend.app.config import Settings
-from backend.app.models import AnalysisResponse, LiveChunkAnalysisResponse
+from backend.app.models import (
+    AnalysisResponse,
+    LiveChunkAnalysisResponse,
+    LiveSessionEndResponse,
+    SoundEvent,
+)
 from backend.app.normalization import normalize_cochl_result, normalize_sound_events
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +68,7 @@ def create_app(frontend_dist: Path | None = DEFAULT_FRONTEND_DIST) -> FastAPI:
     )
     created_app.state.live_conversion_futures = set()
     created_app.state.live_conversion_lock = Lock()
+    created_app.state.live_collection_manager = LiveCollectionManager()
 
     created_app.add_api_route("/api/health", health, methods=["GET"])
     created_app.add_api_route(
@@ -75,6 +82,12 @@ def create_app(frontend_dist: Path | None = DEFAULT_FRONTEND_DIST) -> FastAPI:
         analyze_live_chunk,
         methods=["POST"],
         response_model=LiveChunkAnalysisResponse,
+    )
+    created_app.add_api_route(
+        "/api/live-session/end",
+        end_live_session,
+        methods=["POST"],
+        response_model=LiveSessionEndResponse,
     )
 
     if frontend_dist and (frontend_dist / "index.html").exists():
@@ -196,13 +209,32 @@ async def analyze_live_chunk(
             saved_path,
         )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
-        schedule_live_chunk_conversion(request.app, saved_path)
+        sound_events = normalize_sound_events(raw_result, offset_sec=window_start_sec)
+        collection_status = None
+        if settings.collection_enabled:
+            try:
+                collection_status = await _collect_live_chunk(
+                    request.app,
+                    settings,
+                    sequence_id=sequence_id,
+                    window_start_sec=window_start_sec,
+                    window_end_sec=window_end_sec,
+                    saved_path=saved_path,
+                    events=sound_events,
+                )
+            except Exception:
+                logger.exception(
+                    "Collection failed for live chunk sequence %s.", sequence_id
+                )
+        else:
+            schedule_live_chunk_conversion(request.app, saved_path)
         return LiveChunkAnalysisResponse(
             sequence_id=sequence_id,
             window_start_sec=window_start_sec,
             window_end_sec=window_end_sec,
-            sound_events=normalize_sound_events(raw_result, offset_sec=window_start_sec),
+            sound_events=sound_events,
             processing_time_ms=processing_time_ms,
+            collection_status=collection_status,
         )
     except UploadTooLargeError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
@@ -214,6 +246,48 @@ async def analyze_live_chunk(
             status_code=502,
             detail="Cochl live chunk analysis failed.",
         ) from exc
+
+
+async def end_live_session(
+    request: Request,
+    session_id: str = Form(...),
+) -> LiveSessionEndResponse:
+    manager: LiveCollectionManager = request.app.state.live_collection_manager
+    safe_session_id = _safe_live_session_id(session_id)
+    return await run_in_threadpool(manager.end_session, safe_session_id)
+
+
+async def _collect_live_chunk(
+    current_app: FastAPI,
+    settings: Settings,
+    *,
+    sequence_id: int,
+    window_start_sec: float,
+    window_end_sec: float,
+    saved_path: Path,
+    events: list[SoundEvent],
+) -> str:
+    manager: LiveCollectionManager = current_app.state.live_collection_manager
+    safe_session_id = saved_path.parent.name
+    output_dir = DEFAULT_RECORDINGS_DIR / "collected" / safe_session_id
+
+    def schedule_segment_conversion(wav_path: Path) -> None:
+        schedule_live_chunk_conversion(current_app, wav_path)
+
+    def add_chunk() -> str:
+        return manager.add_chunk(
+            safe_session_id,
+            output_dir=output_dir,
+            policy=policy_from_settings(settings),
+            mp3_scheduler=schedule_segment_conversion,
+            sequence_id=sequence_id,
+            window_start_sec=window_start_sec,
+            window_end_sec=window_end_sec,
+            wav_path=saved_path,
+            events=events,
+        )
+
+    return await run_in_threadpool(add_chunk)
 
 
 async def _save_upload(

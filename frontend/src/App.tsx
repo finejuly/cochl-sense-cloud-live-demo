@@ -2,6 +2,7 @@ import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
+  Database,
   Mic,
   Pause,
   Play,
@@ -10,7 +11,7 @@ import {
   Trash2,
   UploadCloud,
 } from 'lucide-react';
-import { analyzeLiveChunk, analyzeRecording } from './api';
+import { analyzeLiveChunk, analyzeRecording, endLiveSession } from './api';
 import { getAudioContextConstructor } from './audioContext';
 import { LiveSpectrogramPanel } from './LiveSpectrogramPanel';
 import {
@@ -42,7 +43,12 @@ import {
   type LiveChunkRecord,
 } from './liveChunkRecords';
 import { fileFromRecordingChunks, selectSupportedMimeType } from './recorder';
-import type { AnalysisResponse, SoundEvent } from './types';
+import type {
+  AnalysisResponse,
+  LiveChunkCollectionStatus,
+  LiveSessionEndResponse,
+  SoundEvent,
+} from './types';
 import { eventOverlayStyle, formatTime, peaksFromSamples } from './waveform';
 import './App.css';
 
@@ -57,6 +63,29 @@ const LIVE_VIEWPORT_SEC = 20;
 const LIVE_SPECTROGRAM_FPS = 12;
 const LIVE_SPECTROGRAM_BINS = 64;
 const LIVE_HISTORY_LIMIT = 6;
+
+interface LiveCollectionCounts {
+  collected: number;
+  discardedSilent: number;
+  discardedSpeech: number;
+}
+
+function emptyLiveCollectionCounts(): LiveCollectionCounts {
+  return { collected: 0, discardedSilent: 0, discardedSpeech: 0 };
+}
+
+function applyCollectionStatus(
+  counts: LiveCollectionCounts,
+  status: LiveChunkCollectionStatus,
+): LiveCollectionCounts {
+  if (status === 'collected') {
+    return { ...counts, collected: counts.collected + 1 };
+  }
+  if (status === 'discarded_speech') {
+    return { ...counts, discardedSpeech: counts.discardedSpeech + 1 };
+  }
+  return { ...counts, discardedSilent: counts.discardedSilent + 1 };
+}
 
 interface LiveLatencySample {
   label: string;
@@ -84,6 +113,10 @@ export default function App() {
   const [liveLatencySample, setLiveLatencySample] = useState<LiveLatencySample | null>(null);
   const [liveChunkRecords, setLiveChunkRecords] = useState<LiveChunkRecord[]>([]);
   const [liveChunkSnapshotMs, setLiveChunkSnapshotMs] = useState(() => Date.now());
+  const [liveCollectionCounts, setLiveCollectionCounts] = useState<LiveCollectionCounts>(
+    () => emptyLiveCollectionCounts(),
+  );
+  const [collectionSummary, setCollectionSummary] = useState<LiveSessionEndResponse | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
@@ -126,7 +159,9 @@ export default function App() {
 
   useEffect(() => {
     return () => {
+      const liveSessionToken = liveSessionTokenRef.current;
       stopLiveCapture({ clearTimeline: false, invalidateSession: true });
+      void finalizeLiveSession(liveSessionToken, { showSummary: false });
     };
   }, []);
 
@@ -206,9 +241,11 @@ export default function App() {
     if (!recorder || recorder.state === 'inactive') {
       return;
     }
+    const liveSessionToken = liveSessionTokenRef.current;
     stopLiveCapture({ clearTimeline: false, invalidateSession: false });
     recorder.stop();
     stopTracks();
+    void finalizeLiveSession(liveSessionToken, { showSummary: true });
   }
 
   async function submitRecording() {
@@ -231,8 +268,10 @@ export default function App() {
   }
 
   function discardRecording() {
+    const liveSessionToken = liveSessionTokenRef.current;
     recordingSessionRef.current += 1;
     stopLiveCapture({ clearTimeline: true, invalidateSession: true });
+    void finalizeLiveSession(liveSessionToken, { showSummary: false });
     if (recorderRef.current?.state === 'recording') {
       recorderRef.current.stop();
     }
@@ -302,6 +341,26 @@ export default function App() {
     setLiveAutoFollow(true);
     setLiveChunkRecords([]);
     setLiveChunkSnapshotMs(Date.now());
+    setLiveCollectionCounts(emptyLiveCollectionCounts());
+    setCollectionSummary(null);
+  }
+
+  async function finalizeLiveSession(
+    liveSessionToken: string,
+    { showSummary }: { showSummary: boolean },
+  ) {
+    if (!liveSessionToken.startsWith('session-')) {
+      return;
+    }
+
+    try {
+      const summary = await endLiveSession(liveSessionToken);
+      if (showSummary && liveSessionToken === liveSessionTokenRef.current) {
+        setCollectionSummary(summary);
+      }
+    } catch (err) {
+      console.warn('[Cochl.Sense Cloud Live Demo] 수집 세션 종료 실패:', errorMessage(err));
+    }
   }
 
   function upsertLiveChunkState(next: LiveChunkRecord) {
@@ -384,6 +443,10 @@ export default function App() {
         responseReceivedAtMs,
       );
       upsertLiveChunkState(currentRecord);
+      const collectionStatus = response.collection_status;
+      if (collectionStatus) {
+        setLiveCollectionCounts((current) => applyCollectionStatus(current, collectionStatus));
+      }
 
       const timelineEvents = liveTimelineEventsFromResponse(response, LIVE_CONFIDENCE_THRESHOLD);
       if (timelineEvents.length) {
@@ -516,6 +579,10 @@ export default function App() {
   const canDiscard = status !== 'uploading' && status !== 'idle';
   const canDownloadCsv =
     (status === 'ready' || status === 'uploading' || status === 'complete') && liveChunkRecords.length > 0;
+  const hasCollectionActivity =
+    liveCollectionCounts.collected > 0 ||
+    liveCollectionCounts.discardedSilent > 0 ||
+    liveCollectionCounts.discardedSpeech > 0;
 
   return (
     <main className="app-shell">
@@ -535,6 +602,15 @@ export default function App() {
           <div className="meta-row">
             <span>완료 후 업로드</span>
             <span>{selectedMimeType || '녹음 대기'}</span>
+            {(status === 'recording' || hasCollectionActivity) && (
+              <span
+                aria-label="실시간 데이터 수집 현황"
+                title="의미 있는 소리 구간만 저장합니다. 무음과 음성(프라이버시) 구간은 제외됩니다."
+              >
+                수집 {liveCollectionCounts.collected} · 무음 제외 {liveCollectionCounts.discardedSilent} · 음성 제외{' '}
+                {liveCollectionCounts.discardedSpeech}
+              </span>
+            )}
             {liveLatencySample && (
               <span
                 aria-label="최근 실시간 감지 지연"
@@ -595,6 +671,8 @@ export default function App() {
           </div>
         )}
 
+        {collectionSummary && <CollectionSummaryPanel summary={collectionSummary} />}
+
         {analysis && <AnalysisPanel analysis={analysis} recordingFile={recordingFile} />}
       </section>
     </main>
@@ -626,6 +704,47 @@ function formatLiveLatencyTitle(sample: LiveLatencySample): string {
 
 function formatLatency(milliseconds: number): string {
   return `${(milliseconds / 1000).toFixed(2)}초`;
+}
+
+function CollectionSummaryPanel({ summary }: { summary: LiveSessionEndResponse }) {
+  const hasSegments = summary.segment_count > 0;
+
+  return (
+    <section className="collection-summary" aria-labelledby="collection-summary-title">
+      <header className="collection-summary-header">
+        <Database size={18} aria-hidden="true" />
+        <h2 id="collection-summary-title">데이터 수집 결과</h2>
+      </header>
+      <p className="collection-summary-stats">
+        세그먼트 {summary.segment_count}개 · 총 {summary.total_collected_duration_sec.toFixed(1)}초 저장 · 무음 제외{' '}
+        {summary.discarded_silent_chunk_count}개 · 음성(프라이버시) 제외 {summary.discarded_speech_chunk_count}개
+      </p>
+      {hasSegments ? (
+        <ul className="collection-segment-list">
+          {summary.segments.map((segment) => (
+            <li key={segment.segment_index} className="collection-segment-item">
+              <span className="collection-segment-index">#{segment.segment_index}</span>
+              <span className="collection-segment-range">
+                {formatTime(segment.start_sec)}–{formatTime(segment.end_sec)} ({segment.duration_sec.toFixed(1)}초)
+              </span>
+              <span className="collection-segment-labels">
+                {segment.labels.length ? segment.labels.join(', ') : '라벨 없음'}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="collection-summary-empty">
+          수집된 세그먼트가 없습니다. 의미 있는 소리가 감지된 구간만 저장됩니다.
+        </p>
+      )}
+      {hasSegments && (
+        <p className="collection-summary-note">
+          저장 위치: recordings/collected/{summary.session_id}/ (세그먼트 오디오 + 메타데이터 JSON)
+        </p>
+      )}
+    </section>
+  );
 }
 
 function StatusBadge({ status }: { status: RecorderStatus }) {

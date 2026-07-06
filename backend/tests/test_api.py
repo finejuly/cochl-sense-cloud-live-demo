@@ -1,6 +1,10 @@
 import asyncio
+import io
+import json
+import struct
 import threading
 import time
+import wave
 from concurrent.futures import Future
 
 import httpx
@@ -38,6 +42,24 @@ class FakeProvider:
 
 def override_settings():
     return Settings(cochl_project_key="test-key")
+
+
+def override_settings_without_collection():
+    return Settings(cochl_project_key="test-key", collection_enabled=False)
+
+
+def make_wav_bytes(start_sec: float, end_sec: float, framerate: int = 100) -> bytes:
+    start_frame = round(start_sec * framerate)
+    frame_count = round((end_sec - start_sec) * framerate)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(framerate)
+        writer.writeframes(
+            struct.pack(f"<{frame_count}h", *range(start_frame, start_frame + frame_count))
+        )
+    return buffer.getvalue()
 
 
 def test_health_returns_ready():
@@ -156,7 +178,7 @@ def test_analyze_live_chunk_returns_offset_sound_events_and_preserves_debug_audi
         raising=False,
     )
     created_app = create_app(frontend_dist=None)
-    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.dependency_overrides[get_settings] = override_settings_without_collection
     created_app.state.provider_factory = lambda settings: CapturingProvider(settings)
     client = TestClient(created_app)
 
@@ -225,7 +247,7 @@ def test_analyze_live_chunk_does_not_wait_for_debug_audio_conversion(
         raising=False,
     )
     created_app = create_app(frontend_dist=None)
-    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.dependency_overrides[get_settings] = override_settings_without_collection
     created_app.state.provider_factory = lambda settings: CapturingProvider(settings)
     client = TestClient(created_app)
 
@@ -443,6 +465,155 @@ def test_analyze_live_chunk_limits_server_side_provider_concurrency(tmp_path, mo
 
     assert [response.status_code for response in responses] == [200] * request_count
     assert max_active_calls == 2
+
+
+def post_live_chunk(client, session_id, sequence_id, start_sec, end_sec):
+    return client.post(
+        "/api/analyze-live-chunk",
+        data={
+            "session_id": session_id,
+            "sequence_id": str(sequence_id),
+            "window_start_sec": f"{start_sec:.1f}",
+            "window_end_sec": f"{end_sec:.1f}",
+        },
+        files={
+            "file": ("chunk.wav", make_wav_bytes(start_sec, end_sec), "audio/wav"),
+        },
+    )
+
+
+def test_analyze_live_chunk_collects_meaningful_audio_into_segments(
+    tmp_path,
+    monkeypatch,
+):
+    recordings_dir = tmp_path / "recordings"
+
+    class DetectingProvider(FakeProvider):
+        def analyze_live_chunk(self, path):
+            return {
+                "sound_event_detection": {
+                    "status": "success",
+                    "results": [
+                        {
+                            "start_time_sec": 0.25,
+                            "end_time_sec": 1.25,
+                            "classes": [{"class": "Keyboard", "confidence": 0.72}],
+                        }
+                    ],
+                }
+            }
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    monkeypatch.setattr(
+        "backend.app.main.convert_live_chunk_to_mp3",
+        lambda wav_path: None,
+        raising=False,
+    )
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: DetectingProvider(settings)
+    client = TestClient(created_app)
+
+    try:
+        responses = [
+            post_live_chunk(client, "collect-test", sequence_id, start, end)
+            for sequence_id, (start, end) in enumerate(
+                [(0, 2), (1, 3), (2, 4)], start=1
+            )
+        ]
+        end_response = client.post(
+            "/api/live-session/end",
+            data={"session_id": "collect-test"},
+        )
+    finally:
+        created_app.dependency_overrides.clear()
+        created_app.state.provider_factory = None
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert [response.json()["collection_status"] for response in responses] == [
+        "collected",
+        "collected",
+        "collected",
+    ]
+
+    summary = end_response.json()
+    assert end_response.status_code == 200
+    assert summary["session_id"] == "collect-test"
+    assert summary["segment_count"] == 1
+    assert summary["kept_chunk_count"] == 3
+    assert summary["total_collected_duration_sec"] == 4.0
+    segment = summary["segments"][0]
+    assert segment["labels"] == ["Keyboard"]
+
+    collected_dir = recordings_dir / "collected" / "collect-test"
+    assert (collected_dir / segment["audio_filename"]).exists()
+    metadata = json.loads(
+        (collected_dir / segment["metadata_filename"]).read_text("utf-8")
+    )
+    assert metadata["chunk_sequence_ids"] == [1, 2, 3]
+    assert not (recordings_dir / "live" / "collect-test").exists()
+
+
+def test_analyze_live_chunk_discards_speech_chunks_for_privacy(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: FakeProvider(settings)
+    client = TestClient(created_app)
+
+    class SpeechProvider(FakeProvider):
+        def analyze_live_chunk(self, path):
+            return {
+                "sound_event_detection": {
+                    "status": "success",
+                    "results": [
+                        {
+                            "start_time_sec": 0.0,
+                            "end_time_sec": 1.0,
+                            "classes": [{"class": "Male_speech", "confidence": 0.9}],
+                        }
+                    ],
+                }
+            }
+
+    created_app.state.provider_factory = lambda settings: SpeechProvider(settings)
+
+    try:
+        chunk_response = post_live_chunk(client, "speech-test", 1, 0, 2)
+        end_response = client.post(
+            "/api/live-session/end",
+            data={"session_id": "speech-test"},
+        )
+    finally:
+        created_app.dependency_overrides.clear()
+        created_app.state.provider_factory = None
+
+    assert chunk_response.status_code == 200
+    assert chunk_response.json()["collection_status"] == "discarded_speech"
+    summary = end_response.json()
+    assert summary["segment_count"] == 0
+    assert summary["discarded_speech_chunk_count"] == 1
+    assert not (recordings_dir / "live" / "speech-test").exists()
+    assert not (recordings_dir / "collected" / "speech-test").exists()
+
+
+def test_end_live_session_for_unknown_session_returns_empty_summary():
+    created_app = create_app(frontend_dist=None)
+    client = TestClient(created_app)
+
+    response = client.post(
+        "/api/live-session/end",
+        data={"session_id": "missing-session"},
+    )
+
+    summary = response.json()
+    assert response.status_code == 200
+    assert summary["session_id"] == "missing-session"
+    assert summary["segment_count"] == 0
+    assert summary["kept_chunk_count"] == 0
+    assert summary["segments"] == []
 
 
 def test_create_app_serves_built_frontend(tmp_path):

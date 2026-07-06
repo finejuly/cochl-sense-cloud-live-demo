@@ -52,3 +52,25 @@ class LiveChunkAnalysisResponse(BaseModel):
     window_end_sec: float
     sound_events: list[SoundEvent] = Field(default_factory=list)
     processing_time_ms: int
+    collection_status: str | None = None
+
+
+class CollectedSegmentSummary(BaseModel):
+    segment_index: int
+    start_sec: float
+    end_sec: float
+    duration_sec: float
+    event_count: int
+    labels: list[str] = Field(default_factory=list)
+    audio_filename: str
+    metadata_filename: str
+
+
+class LiveSessionEndResponse(BaseModel):
+    session_id: str
+    segment_count: int
+    total_collected_duration_sec: float
+    kept_chunk_count: int
+    discarded_silent_chunk_count: int
+    discarded_speech_chunk_count: int
+    segments: list[CollectedSegmentSummary] = Field(default_factory=list)

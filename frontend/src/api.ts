@@ -1,4 +1,4 @@
-import type { AnalysisResponse, LiveChunkAnalysisResponse } from './types';
+import type { AnalysisResponse, LiveChunkAnalysisResponse, LiveSessionEndResponse } from './types';
 
 export interface AnalyzeLiveChunkInput {
   file: Blob;
@@ -44,6 +44,23 @@ export async function analyzeLiveChunk(input: AnalyzeLiveChunkInput): Promise<Li
   }
 
   return response.json() as Promise<LiveChunkAnalysisResponse>;
+}
+
+export async function endLiveSession(sessionId: string): Promise<LiveSessionEndResponse> {
+  const formData = new FormData();
+  formData.append('session_id', sessionId);
+
+  const response = await fetch('/api/live-session/end', {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const message = await readErrorMessage(response);
+    throw new Error(message);
+  }
+
+  return response.json() as Promise<LiveSessionEndResponse>;
 }
 
 function liveChunkUploadFilename(input: AnalyzeLiveChunkInput): string {
