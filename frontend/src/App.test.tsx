@@ -7,6 +7,9 @@ const appMocks = vi.hoisted(() => ({
   analyzeRecording: vi.fn(),
   analyzeLiveChunk: vi.fn(),
   endLiveSession: vi.fn(),
+  fetchCollectedSessions: vi.fn(),
+  deleteCollectedSession: vi.fn(),
+  deleteCollectedSegment: vi.fn(),
   createLiveAudioCapture: vi.fn(),
   liveWindowCallbacks: [] as Array<(window: LiveAudioWindow) => void>,
   liveSpectrogramCallbacks: [] as Array<(frame: LiveSpectrogramFrame) => void>,
@@ -17,6 +20,11 @@ vi.mock('./api', () => ({
   analyzeRecording: appMocks.analyzeRecording,
   analyzeLiveChunk: appMocks.analyzeLiveChunk,
   endLiveSession: appMocks.endLiveSession,
+  fetchCollectedSessions: appMocks.fetchCollectedSessions,
+  deleteCollectedSession: appMocks.deleteCollectedSession,
+  deleteCollectedSegment: appMocks.deleteCollectedSegment,
+  collectedFileUrl: (sessionId: string, filename: string) =>
+    `/api/collected-sessions/${sessionId}/files/${filename}`,
 }));
 
 vi.mock('./liveAudio', async (importOriginal) => {
@@ -47,6 +55,9 @@ beforeEach(() => {
   });
   appMocks.endLiveSession.mockImplementation(async (sessionId: string) => ({
     session_id: sessionId,
+    session_name: null,
+    started_at: null,
+    ended_at: null,
     segment_count: 0,
     total_collected_duration_sec: 0,
     kept_chunk_count: 0,
@@ -54,6 +65,12 @@ beforeEach(() => {
     discarded_speech_chunk_count: 0,
     segments: [],
   }));
+  appMocks.fetchCollectedSessions.mockReset();
+  appMocks.deleteCollectedSession.mockReset();
+  appMocks.deleteCollectedSegment.mockReset();
+  appMocks.fetchCollectedSessions.mockResolvedValue({ sessions: [] });
+  appMocks.deleteCollectedSession.mockResolvedValue(undefined);
+  appMocks.deleteCollectedSegment.mockResolvedValue(undefined);
   appMocks.createLiveAudioCapture.mockImplementation((_stream, onWindow, options?: LiveAudioCaptureOptions) => {
     appMocks.liveWindowCallbacks.push(onWindow);
     if (options?.onSpectrogramFrame) {
@@ -398,6 +415,67 @@ describe('App', () => {
 
       await waitFor(() => expect(appMocks.endLiveSession).toHaveBeenCalledTimes(1));
       expect(screen.queryByText(/데이터 수집 결과/)).not.toBeInTheDocument();
+    } finally {
+      recording.restore();
+    }
+  });
+
+  it('sends the session name with live chunks and the session end request', async () => {
+    const recording = installRecordingEnvironment();
+
+    try {
+      render(<App />);
+      await userEvent.type(screen.getByLabelText(/세션 이름/), '사무실 소음');
+      await userEvent.click(screen.getByRole('button', { name: /녹음 시작/i }));
+      await screen.findByText(/녹음 중/i);
+
+      await act(async () => {
+        appMocks.liveWindowCallbacks[0](liveWindow(0, 2));
+      });
+
+      expect(appMocks.analyzeLiveChunk).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionName: '사무실 소음' }),
+      );
+
+      await userEvent.click(screen.getByRole('button', { name: /완료/i }));
+
+      await waitFor(() => expect(appMocks.endLiveSession).toHaveBeenCalledTimes(1));
+      expect(appMocks.endLiveSession).toHaveBeenCalledWith(
+        expect.stringMatching(/^session-/),
+        '사무실 소음',
+      );
+    } finally {
+      recording.restore();
+    }
+  });
+
+  it('waits for in-flight live chunks to drain before ending the session', async () => {
+    const recording = installRecordingEnvironment();
+    const request = deferredLiveResponse(1);
+    appMocks.analyzeLiveChunk.mockReturnValue(request.promise);
+
+    try {
+      render(<App />);
+      await userEvent.click(screen.getByRole('button', { name: /녹음 시작/i }));
+      await screen.findByText(/녹음 중/i);
+
+      await act(async () => {
+        appMocks.liveWindowCallbacks[0](liveWindow(0, 2));
+      });
+
+      await userEvent.click(screen.getByRole('button', { name: /완료/i }));
+
+      expect(screen.getByText(/수집 데이터를 정리하고 있습니다/)).toBeInTheDocument();
+      expect(appMocks.endLiveSession).not.toHaveBeenCalled();
+
+      await act(async () => {
+        request.resolve(liveResponse(1, []));
+      });
+
+      await waitFor(() => expect(appMocks.endLiveSession).toHaveBeenCalledTimes(1));
+      await waitFor(() =>
+        expect(screen.queryByText(/수집 데이터를 정리하고 있습니다/)).not.toBeInTheDocument(),
+      );
     } finally {
       recording.restore();
     }

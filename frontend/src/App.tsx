@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { analyzeLiveChunk, analyzeRecording, endLiveSession } from './api';
 import { getAudioContextConstructor } from './audioContext';
+import { CollectedSessionsPanel } from './CollectedSessionsPanel';
 import { LiveSpectrogramPanel } from './LiveSpectrogramPanel';
 import {
   createLiveAudioCapture,
@@ -117,6 +118,10 @@ export default function App() {
     () => emptyLiveCollectionCounts(),
   );
   const [collectionSummary, setCollectionSummary] = useState<LiveSessionEndResponse | null>(null);
+  const [collectionFinalizing, setCollectionFinalizing] = useState(false);
+  const [collectedRefreshToken, setCollectedRefreshToken] = useState(0);
+  const [sessionName, setSessionName] = useState('');
+  const sessionNameRef = useRef('');
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
@@ -345,6 +350,17 @@ export default function App() {
     setCollectionSummary(null);
   }
 
+  async function waitForLiveDrain(liveSessionToken: string, maxWaitMs = 8000) {
+    const startedAt = Date.now();
+    while (
+      liveSessionToken === liveSessionTokenRef.current &&
+      liveInFlightRef.current > 0 &&
+      Date.now() - startedAt < maxWaitMs
+    ) {
+      await new Promise((resolve) => window.setTimeout(resolve, 200));
+    }
+  }
+
   async function finalizeLiveSession(
     liveSessionToken: string,
     { showSummary }: { showSummary: boolean },
@@ -353,13 +369,27 @@ export default function App() {
       return;
     }
 
+    if (showSummary) {
+      setCollectionFinalizing(true);
+      // 분석 중인 마지막 청크들까지 수집에 반영한 뒤 세션을 닫는다.
+      await waitForLiveDrain(liveSessionToken);
+    }
+
     try {
-      const summary = await endLiveSession(liveSessionToken);
+      const summary = await endLiveSession(
+        liveSessionToken,
+        sessionNameRef.current.trim() || undefined,
+      );
       if (showSummary && liveSessionToken === liveSessionTokenRef.current) {
         setCollectionSummary(summary);
       }
+      setCollectedRefreshToken((token) => token + 1);
     } catch (err) {
       console.warn('[Cochl.Sense Cloud Live Demo] 수집 세션 종료 실패:', errorMessage(err));
+    } finally {
+      if (showSummary) {
+        setCollectionFinalizing(false);
+      }
     }
   }
 
@@ -431,6 +461,7 @@ export default function App() {
         sequenceId: currentRecord.sequenceId,
         windowStartSec: window.windowStartSec,
         windowEndSec: window.windowEndSec,
+        sessionName: sessionNameRef.current.trim() || undefined,
       });
       const responseReceivedAtMs = Date.now();
       if (liveSessionToken !== liveSessionTokenRef.current) {
@@ -520,6 +551,11 @@ export default function App() {
   function stopTracks() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+  }
+
+  function handleSessionNameChange(event: ChangeEvent<HTMLInputElement>) {
+    setSessionName(event.target.value);
+    sessionNameRef.current = event.target.value;
   }
 
   function handleLiveViewportStartChange(startSec: number) {
@@ -637,6 +673,17 @@ export default function App() {
             onViewportStartChange={handleLiveViewportStartChange}
             onJumpToLatest={handleLiveJumpToLatest}
           />
+          <div className="session-name-row">
+            <label htmlFor="session-name-input">세션 이름</label>
+            <input
+              id="session-name-input"
+              type="text"
+              value={sessionName}
+              maxLength={100}
+              placeholder="예: 사무실 오후 소음 (선택)"
+              onChange={handleSessionNameChange}
+            />
+          </div>
           <div className="controls" aria-label="녹음 컨트롤">
             <button className="primary" type="button" onClick={startRecording} disabled={!canStart}>
               <Mic size={18} aria-hidden="true" />
@@ -664,6 +711,13 @@ export default function App() {
           </div>
         )}
 
+        {collectionFinalizing && (
+          <div className="notice progress" role="status">
+            <RefreshCw size={18} aria-hidden="true" />
+            수집 데이터를 정리하고 있습니다.
+          </div>
+        )}
+
         {error && (
           <div className="notice error" role="alert">
             <AlertTriangle size={18} aria-hidden="true" />
@@ -674,6 +728,8 @@ export default function App() {
         {collectionSummary && <CollectionSummaryPanel summary={collectionSummary} />}
 
         {analysis && <AnalysisPanel analysis={analysis} recordingFile={recordingFile} />}
+
+        <CollectedSessionsPanel refreshToken={collectedRefreshToken} />
       </section>
     </main>
   );
@@ -715,6 +771,13 @@ function CollectionSummaryPanel({ summary }: { summary: LiveSessionEndResponse }
         <Database size={18} aria-hidden="true" />
         <h2 id="collection-summary-title">데이터 수집 결과</h2>
       </header>
+      {(summary.session_name || summary.started_at) && (
+        <p className="collection-summary-session">
+          {summary.session_name && <strong>{summary.session_name}</strong>}
+          {summary.session_name && summary.started_at && ' · '}
+          {summary.started_at && formatIsoTimestamp(summary.started_at)}
+        </p>
+      )}
       <p className="collection-summary-stats">
         세그먼트 {summary.segment_count}개 · 총 {summary.total_collected_duration_sec.toFixed(1)}초 저장 · 무음 제외{' '}
         {summary.discarded_silent_chunk_count}개 · 음성(프라이버시) 제외 {summary.discarded_speech_chunk_count}개
@@ -745,6 +808,20 @@ function CollectionSummaryPanel({ summary }: { summary: LiveSessionEndResponse }
       )}
     </section>
   );
+}
+
+function formatIsoTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleString('ko-KR', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 function StatusBadge({ status }: { status: RecorderStatus }) {

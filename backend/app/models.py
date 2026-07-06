@@ -68,9 +68,30 @@ class CollectedSegmentSummary(BaseModel):
 
 class LiveSessionEndResponse(BaseModel):
     session_id: str
+    session_name: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
     segment_count: int
     total_collected_duration_sec: float
     kept_chunk_count: int
     discarded_silent_chunk_count: int
     discarded_speech_chunk_count: int
     segments: list[CollectedSegmentSummary] = Field(default_factory=list)
+
+
+class CollectedSessionInfo(BaseModel):
+    session_id: str
+    session_name: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    segment_count: int
+    total_collected_duration_sec: float
+    segments: list[CollectedSegmentSummary] = Field(default_factory=list)
+
+
+class CollectedSessionsResponse(BaseModel):
+    sessions: list[CollectedSessionInfo] = Field(default_factory=list)
+
+
+class DeletionResponse(BaseModel):
+    status: str = "deleted"

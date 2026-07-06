@@ -1,4 +1,9 @@
-import type { AnalysisResponse, LiveChunkAnalysisResponse, LiveSessionEndResponse } from './types';
+import type {
+  AnalysisResponse,
+  CollectedSessionsResponse,
+  LiveChunkAnalysisResponse,
+  LiveSessionEndResponse,
+} from './types';
 
 export interface AnalyzeLiveChunkInput {
   file: Blob;
@@ -6,6 +11,7 @@ export interface AnalyzeLiveChunkInput {
   sequenceId: number;
   windowStartSec: number;
   windowEndSec: number;
+  sessionName?: string;
 }
 
 export async function analyzeRecording(file: File): Promise<AnalysisResponse> {
@@ -32,6 +38,9 @@ export async function analyzeLiveChunk(input: AnalyzeLiveChunkInput): Promise<Li
   formData.append('sequence_id', String(input.sequenceId));
   formData.append('window_start_sec', String(input.windowStartSec));
   formData.append('window_end_sec', String(input.windowEndSec));
+  if (input.sessionName) {
+    formData.append('session_name', input.sessionName);
+  }
 
   const response = await fetch('/api/analyze-live-chunk', {
     method: 'POST',
@@ -46,9 +55,15 @@ export async function analyzeLiveChunk(input: AnalyzeLiveChunkInput): Promise<Li
   return response.json() as Promise<LiveChunkAnalysisResponse>;
 }
 
-export async function endLiveSession(sessionId: string): Promise<LiveSessionEndResponse> {
+export async function endLiveSession(
+  sessionId: string,
+  sessionName?: string,
+): Promise<LiveSessionEndResponse> {
   const formData = new FormData();
   formData.append('session_id', sessionId);
+  if (sessionName) {
+    formData.append('session_name', sessionName);
+  }
 
   const response = await fetch('/api/live-session/end', {
     method: 'POST',
@@ -61,6 +76,44 @@ export async function endLiveSession(sessionId: string): Promise<LiveSessionEndR
   }
 
   return response.json() as Promise<LiveSessionEndResponse>;
+}
+
+export async function fetchCollectedSessions(): Promise<CollectedSessionsResponse> {
+  const response = await fetch('/api/collected-sessions');
+
+  if (!response.ok) {
+    const message = await readErrorMessage(response);
+    throw new Error(message);
+  }
+
+  return response.json() as Promise<CollectedSessionsResponse>;
+}
+
+export async function deleteCollectedSession(sessionId: string): Promise<void> {
+  const response = await fetch(`/api/collected-sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  });
+
+  if (!response.ok) {
+    const message = await readErrorMessage(response);
+    throw new Error(message);
+  }
+}
+
+export async function deleteCollectedSegment(sessionId: string, filename: string): Promise<void> {
+  const response = await fetch(
+    `/api/collected-sessions/${encodeURIComponent(sessionId)}/segments/${encodeURIComponent(filename)}`,
+    { method: 'DELETE' },
+  );
+
+  if (!response.ok) {
+    const message = await readErrorMessage(response);
+    throw new Error(message);
+  }
+}
+
+export function collectedFileUrl(sessionId: string, filename: string): string {
+  return `/api/collected-sessions/${encodeURIComponent(sessionId)}/files/${encodeURIComponent(filename)}`;
 }
 
 function liveChunkUploadFilename(input: AnalyzeLiveChunkInput): string {

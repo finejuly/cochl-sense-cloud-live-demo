@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import wave
 from bisect import insort
 from collections.abc import Callable, Sequence
@@ -14,6 +15,7 @@ from time import monotonic
 from backend.app.config import Settings
 from backend.app.models import (
     CollectedSegmentSummary,
+    CollectedSessionInfo,
     LiveSessionEndResponse,
     SoundEvent,
 )
@@ -95,11 +97,14 @@ class SegmentCollector:
         output_dir: Path,
         policy: CollectionPolicy,
         mp3_scheduler: Callable[[Path], object] | None = None,
+        session_name: str | None = None,
     ):
         self.session_id = session_id
         self.output_dir = output_dir
         self.policy = policy
         self.mp3_scheduler = mp3_scheduler
+        self.session_name = session_name
+        self.started_at = datetime.now(timezone.utc)
         self.last_activity_monotonic = monotonic()
         self._lock = Lock()
         self._pending: list[_ChunkEntry] = []
@@ -155,6 +160,9 @@ class SegmentCollector:
             self._finalize_current_segment("session_end")
             summary = LiveSessionEndResponse(
                 session_id=self.session_id,
+                session_name=self.session_name,
+                started_at=self.started_at.isoformat(),
+                ended_at=datetime.now(timezone.utc).isoformat(),
                 segment_count=len(self._segments),
                 total_collected_duration_sec=round(
                     sum(segment.duration_sec for segment in self._segments), 3
@@ -284,6 +292,8 @@ class SegmentCollector:
     ) -> dict:
         return {
             "session_id": self.session_id,
+            "session_name": self.session_name,
+            "session_started_at": self.started_at.isoformat(),
             "segment_index": segment_index,
             "start_sec": round(start_sec, 3),
             "end_sec": round(end_sec, 3),
@@ -415,12 +425,18 @@ def _sorted_unique_labels(chunks: list[_ChunkEntry]) -> list[str]:
 
 
 class LiveCollectionManager:
-    """Tracks one SegmentCollector per live session across requests."""
+    """Tracks one SegmentCollector per live session across requests.
+
+    Ended sessions leave a tombstone so chunks whose analyses complete after
+    `end_session` are deleted immediately instead of respawning a collector
+    that would strand files in `recordings/live/`.
+    """
 
     def __init__(self, stale_session_sec: float = DEFAULT_STALE_SESSION_SEC):
         self.stale_session_sec = stale_session_sec
         self._lock = Lock()
         self._collectors: dict[str, SegmentCollector] = {}
+        self._ended_sessions: dict[str, float] = {}
 
     def add_chunk(
         self,
@@ -429,6 +445,7 @@ class LiveCollectionManager:
         output_dir: Path,
         policy: CollectionPolicy,
         mp3_scheduler: Callable[[Path], object] | None = None,
+        session_name: str | None = None,
         sequence_id: int,
         window_start_sec: float,
         window_end_sec: float,
@@ -436,6 +453,10 @@ class LiveCollectionManager:
         events: Sequence[SoundEvent],
     ) -> str:
         with self._lock:
+            self._prune_tombstones()
+            if session_id in self._ended_sessions:
+                _discard_late_chunk(wav_path)
+                return classify_chunk_events(events, policy)
             collector = self._collectors.get(session_id)
             if collector is None:
                 collector = SegmentCollector(
@@ -443,8 +464,11 @@ class LiveCollectionManager:
                     output_dir,
                     policy,
                     mp3_scheduler=mp3_scheduler,
+                    session_name=session_name,
                 )
                 self._collectors[session_id] = collector
+            elif collector.session_name is None and session_name:
+                collector.session_name = session_name
             stale = self._pop_stale_collectors(exclude=session_id)
         for stale_collector in stale:
             stale_collector.end_session()
@@ -456,12 +480,19 @@ class LiveCollectionManager:
             events=events,
         )
 
-    def end_session(self, session_id: str) -> LiveSessionEndResponse:
+    def end_session(
+        self,
+        session_id: str,
+        session_name: str | None = None,
+    ) -> LiveSessionEndResponse:
         with self._lock:
+            self._prune_tombstones()
+            self._ended_sessions[session_id] = monotonic()
             collector = self._collectors.pop(session_id, None)
         if collector is None:
             return LiveSessionEndResponse(
                 session_id=session_id,
+                session_name=session_name,
                 segment_count=0,
                 total_collected_duration_sec=0.0,
                 kept_chunk_count=0,
@@ -469,6 +500,8 @@ class LiveCollectionManager:
                 discarded_speech_chunk_count=0,
                 segments=[],
             )
+        if collector.session_name is None and session_name:
+            collector.session_name = session_name
         return collector.end_session()
 
     def _pop_stale_collectors(self, exclude: str) -> list[SegmentCollector]:
@@ -479,4 +512,142 @@ class LiveCollectionManager:
             if session_id != exclude
             and now - collector.last_activity_monotonic > self.stale_session_sec
         ]
+        for session_id in stale_ids:
+            self._ended_sessions[session_id] = now
         return [self._collectors.pop(session_id) for session_id in stale_ids]
+
+    def _prune_tombstones(self) -> None:
+        now = monotonic()
+        expired = [
+            session_id
+            for session_id, ended_at in self._ended_sessions.items()
+            if now - ended_at > self.stale_session_sec
+        ]
+        for session_id in expired:
+            del self._ended_sessions[session_id]
+
+
+def _discard_late_chunk(wav_path: Path) -> None:
+    try:
+        wav_path.unlink(missing_ok=True)
+        wav_path.parent.rmdir()
+    except OSError:
+        # Parent not empty or already gone — nothing else to clean.
+        pass
+
+
+def safe_collected_session_dir(collected_root: Path, session_id: str) -> Path | None:
+    """Resolves a session directory strictly one level under collected_root."""
+    root = collected_root.resolve()
+    target = (root / session_id).resolve()
+    if target.parent != root or not target.is_dir():
+        return None
+    return target
+
+
+def list_collected_sessions(collected_root: Path) -> list[CollectedSessionInfo]:
+    if not collected_root.is_dir():
+        return []
+    sessions = [
+        info
+        for session_dir in collected_root.iterdir()
+        if session_dir.is_dir()
+        and (info := _load_collected_session(session_dir)) is not None
+    ]
+    sessions.sort(key=lambda session: session.started_at or "", reverse=True)
+    return sessions
+
+
+def _load_collected_session(session_dir: Path) -> CollectedSessionInfo | None:
+    segments: list[CollectedSegmentSummary] = []
+    for metadata_path in sorted(session_dir.glob("segment-*.json")):
+        try:
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Skipping unreadable segment metadata %s.", metadata_path)
+            continue
+        audio_filename = _resolve_segment_audio(session_dir, metadata_path.stem)
+        if audio_filename is None:
+            continue
+        events = data.get("events") or []
+        segments.append(
+            CollectedSegmentSummary(
+                segment_index=int(data.get("segment_index") or len(segments) + 1),
+                start_sec=float(data.get("start_sec") or 0.0),
+                end_sec=float(data.get("end_sec") or 0.0),
+                duration_sec=float(data.get("duration_sec") or 0.0),
+                event_count=len(events),
+                labels=sorted(
+                    {
+                        str(event.get("label"))
+                        for event in events
+                        if isinstance(event, dict) and event.get("label")
+                    }
+                ),
+                audio_filename=audio_filename,
+                metadata_filename=metadata_path.name,
+            )
+        )
+    if not segments:
+        return None
+
+    session_name = started_at = ended_at = None
+    session_json = session_dir / "session.json"
+    if session_json.is_file():
+        try:
+            payload = json.loads(session_json.read_text(encoding="utf-8"))
+            session_name = payload.get("session_name")
+            started_at = payload.get("started_at")
+            ended_at = payload.get("ended_at")
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Skipping unreadable session summary %s.", session_json)
+
+    return CollectedSessionInfo(
+        session_id=session_dir.name,
+        session_name=session_name,
+        started_at=started_at,
+        ended_at=ended_at,
+        segment_count=len(segments),
+        total_collected_duration_sec=round(
+            sum(segment.duration_sec for segment in segments), 3
+        ),
+        segments=segments,
+    )
+
+
+def _resolve_segment_audio(session_dir: Path, stem: str) -> str | None:
+    for suffix in (".mp3", ".wav"):
+        if (session_dir / f"{stem}{suffix}").is_file():
+            return f"{stem}{suffix}"
+    return None
+
+
+def delete_collected_session(collected_root: Path, session_id: str) -> bool:
+    session_dir = safe_collected_session_dir(collected_root, session_id)
+    if session_dir is None:
+        return False
+    shutil.rmtree(session_dir, ignore_errors=True)
+    return True
+
+
+def delete_collected_segment(
+    collected_root: Path,
+    session_id: str,
+    filename: str,
+) -> bool:
+    session_dir = safe_collected_session_dir(collected_root, session_id)
+    if session_dir is None or Path(filename).name != filename:
+        return False
+    stem = Path(filename).stem
+    if not stem.startswith("segment-"):
+        return False
+    deleted = False
+    for suffix in (".wav", ".mp3", ".json"):
+        target = session_dir / f"{stem}{suffix}"
+        if target.is_file():
+            target.unlink(missing_ok=True)
+            deleted = True
+    if deleted and not any(session_dir.glob("segment-*.json")):
+        # Last segment removed — drop the now-empty session directory.
+        shutil.rmtree(session_dir, ignore_errors=True)
+    return deleted

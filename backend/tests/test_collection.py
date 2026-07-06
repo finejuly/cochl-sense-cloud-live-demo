@@ -10,8 +10,12 @@ from backend.app.collection import (
     LiveCollectionManager,
     SegmentCollector,
     classify_chunk_events,
+    delete_collected_segment,
+    delete_collected_session,
     is_privacy_sensitive_label,
+    list_collected_sessions,
     policy_from_settings,
+    safe_collected_session_dir,
 )
 from backend.app.config import Settings
 from backend.app.models import SoundEvent
@@ -348,6 +352,161 @@ def test_manager_end_unknown_session_returns_empty_summary():
     assert summary.segment_count == 0
     assert summary.kept_chunk_count == 0
     assert summary.segments == []
+
+
+def test_manager_deletes_late_chunks_for_ended_sessions(tmp_path):
+    manager = LiveCollectionManager()
+    manager.end_session("session-a")
+
+    late_wav = tmp_path / "live" / "session-a" / "chunk-000009.wav"
+    write_ramp_chunk(late_wav, 8, 10)
+    decision = manager.add_chunk(
+        "session-a",
+        output_dir=tmp_path / "collected" / "session-a",
+        policy=POLICY,
+        sequence_id=9,
+        window_start_sec=8.0,
+        window_end_sec=10.0,
+        wav_path=late_wav,
+        events=[event()],
+    )
+
+    assert decision == CHUNK_COLLECTED
+    assert not late_wav.exists()
+    assert not late_wav.parent.exists()
+    assert "session-a" not in manager._collectors
+
+
+def test_collector_records_session_name_and_timestamps(tmp_path):
+    output_dir = tmp_path / "collected"
+    collector = SegmentCollector(
+        "session-a",
+        output_dir,
+        POLICY,
+        session_name="사무실 소음",
+    )
+    add_chunk(collector, tmp_path / "live", 1, 0, 2, [event()])
+
+    summary = collector.end_session()
+
+    assert summary.session_name == "사무실 소음"
+    assert summary.started_at is not None
+    assert summary.ended_at is not None
+    assert summary.ended_at >= summary.started_at
+    session_summary = json.loads((output_dir / "session.json").read_text("utf-8"))
+    assert session_summary["session_name"] == "사무실 소음"
+    assert session_summary["started_at"] == summary.started_at
+    segment = summary.segments[0]
+    metadata = json.loads((output_dir / segment.metadata_filename).read_text("utf-8"))
+    assert metadata["session_name"] == "사무실 소음"
+    assert metadata["session_started_at"] == summary.started_at
+
+
+def test_manager_applies_session_name_from_chunk_or_end(tmp_path):
+    manager = LiveCollectionManager()
+    wav_path = tmp_path / "live" / "session-a" / "chunk-000001.wav"
+    write_ramp_chunk(wav_path, 0, 2)
+    manager.add_chunk(
+        "session-a",
+        output_dir=tmp_path / "collected" / "session-a",
+        policy=POLICY,
+        session_name=None,
+        sequence_id=1,
+        window_start_sec=0.0,
+        window_end_sec=2.0,
+        wav_path=wav_path,
+        events=[event()],
+    )
+
+    summary = manager.end_session("session-a", session_name="지하철 플랫폼")
+
+    assert summary.session_name == "지하철 플랫폼"
+
+
+def make_collected_session(tmp_path, session_id, name=None, started_at=None):
+    collector = SegmentCollector(
+        session_id,
+        tmp_path / "collected" / session_id,
+        POLICY,
+        session_name=name,
+    )
+    if started_at is not None:
+        collector.started_at = started_at
+    add_chunk(collector, tmp_path / "live" / session_id, 1, 0, 2, [event("Knock", 0.8)])
+    return collector.end_session()
+
+
+def test_list_collected_sessions_reads_metadata_from_disk(tmp_path):
+    from datetime import datetime, timezone
+
+    make_collected_session(
+        tmp_path,
+        "session-old",
+        name="옛 세션",
+        started_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+    )
+    make_collected_session(
+        tmp_path,
+        "session-new",
+        name="새 세션",
+        started_at=datetime(2026, 7, 6, tzinfo=timezone.utc),
+    )
+
+    sessions = list_collected_sessions(tmp_path / "collected")
+
+    assert [session.session_id for session in sessions] == [
+        "session-new",
+        "session-old",
+    ]
+    newest = sessions[0]
+    assert newest.session_name == "새 세션"
+    assert newest.started_at is not None
+    assert newest.segment_count == 1
+    assert newest.segments[0].labels == ["Knock"]
+    assert newest.segments[0].audio_filename.endswith(".wav")
+
+
+def test_list_collected_sessions_handles_missing_root(tmp_path):
+    assert list_collected_sessions(tmp_path / "missing") == []
+
+
+def test_safe_collected_session_dir_rejects_traversal(tmp_path):
+    collected = tmp_path / "collected"
+    (collected / "session-a").mkdir(parents=True)
+    (tmp_path / "secret").mkdir()
+
+    assert safe_collected_session_dir(collected, "session-a") is not None
+    assert safe_collected_session_dir(collected, "../secret") is None
+    assert safe_collected_session_dir(collected, "missing") is None
+
+
+def test_delete_collected_session_removes_directory(tmp_path):
+    make_collected_session(tmp_path, "session-a")
+    collected = tmp_path / "collected"
+
+    assert delete_collected_session(collected, "session-a") is True
+    assert not (collected / "session-a").exists()
+    assert delete_collected_session(collected, "session-a") is False
+    assert delete_collected_session(collected, "../session-a") is False
+
+
+def test_delete_collected_segment_removes_files_and_empty_session(tmp_path):
+    summary = make_collected_session(tmp_path, "session-a")
+    collected = tmp_path / "collected"
+    segment = summary.segments[0]
+
+    assert delete_collected_segment(collected, "session-a", segment.audio_filename)
+    assert not (collected / "session-a").exists()
+
+
+def test_delete_collected_segment_rejects_bad_names(tmp_path):
+    make_collected_session(tmp_path, "session-a")
+    collected = tmp_path / "collected"
+
+    assert delete_collected_segment(collected, "session-a", "../session.json") is False
+    assert delete_collected_segment(collected, "session-a", "session.json") is False
+    assert delete_collected_segment(collected, "session-a", "missing.wav") is False
+    assert (collected / "session-a").exists()
 
 
 def test_manager_finalizes_stale_sessions_on_new_activity(tmp_path):

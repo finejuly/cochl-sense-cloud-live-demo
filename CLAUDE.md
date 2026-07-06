@@ -60,6 +60,9 @@ By default (`COCHL_COLLECTION_ENABLED=true`), analyzed live chunks flow into `co
 - **Out-of-order tolerance**: chunk analyses complete out of order (up to `LIVE_MAX_IN_FLIGHT` concurrent), so entries sit in a reorder buffer and are only folded into segments once the watermark (max window end seen − `reorder_hold_back_sec`) passes them. `POST /api/live-session/end` (called by the frontend on 완료/폐기/unmount) flushes everything and returns a `LiveSessionEndResponse` summary.
 - Collection failures must never fail the analyze response — the route wraps collection in try/except and returns `collection_status: null`.
 - `LiveCollectionManager` (one per app, on `app.state`) keys collectors by *sanitized* session id (`saved_path.parent.name`) and finalizes stale sessions opportunistically.
+- **No live leftovers**: ended sessions leave tombstones in the manager, so a chunk whose analysis completes after `end_session` is deleted instead of respawning a collector; the frontend waits for in-flight requests to drain (max 8 s) before calling end on 완료; and `cleanup_orphan_live_chunks` (lifespan startup) removes `recordings/live/` entirely when collection is enabled. Keep all three intact when touching the live path.
+- **Session naming**: an optional `session_name` form field (chunk + end requests) and collector-side `started_at`/`ended_at` timestamps flow into `session.json`, segment metadata JSONs, and `LiveSessionEndResponse`.
+- **Management API**: `GET /api/collected-sessions` lists sessions from disk (`list_collected_sessions` reads segment JSONs, resolves the actual audio extension since MP3 conversion is async); `GET .../files/{filename}` serves audio/metadata; `DELETE` removes a session dir or one segment (audio+json, dropping the session dir when the last segment goes). All paths are validated with `safe_collected_session_dir` — session dirs must resolve strictly one level under `recordings/collected/`.
 
 ### Backend (`backend/app/`)
 
@@ -80,7 +83,8 @@ Full recordings persist to `recordings/`. With collection enabled (default), mea
 - `liveAudio.ts` — `LiveWindowBuffer` slices the mic stream into overlapping windows; `createLiveAudioCapture` wires the Web Audio graph and emits both windows and spectrogram frames; `encodePcm16Wav` builds the WAV blob sent to the backend.
 - `liveChunkRecords.ts` — the per-chunk state machine. Each chunk is `PENDING | DETECTED | EMPTY | FAIL | SKIP` and carries latency fields; also derives the render geometry for the chunk timeline.
 - `liveTimeline.ts` — merges/lays out detected events into lanes and manages the scrolling viewport.
-- `api.ts` — the three fetch calls (`analyzeRecording`, `analyzeLiveChunk`, `endLiveSession`); error bodies are read from `{ detail }`. **User-facing strings are Korean** — match that when adding UI copy.
+- `api.ts` — all backend fetch calls (`analyzeRecording`, `analyzeLiveChunk`, `endLiveSession`, collected-session list/delete/file-URL helpers); error bodies are read from `{ detail }`. **User-facing strings are Korean** — match that when adding UI copy.
+- `CollectedSessionsPanel.tsx` — self-contained 수집된 데이터 management panel (list, inline audio playback, confirm-guarded deletes). It refetches whenever the `refreshToken` prop changes; `App.tsx` bumps it after each session end.
 - `LiveSpectrogramPanel.tsx`, `waveform.ts`, `recorder.ts`, `audioContext.ts` — canvas rendering, waveform helpers, MediaRecorder wrapper, cross-browser AudioContext lookup.
 
 **Frontend backpressure**: `handleLiveWindow` tracks in-flight requests in `liveInFlightRef` and drops a window as `SKIP` once `LIVE_MAX_IN_FLIGHT` is reached, rather than queuing. A `liveSessionTokenRef` guards every async continuation so stale responses from a previous recording are ignored. This is deliberate — keep new async live-path work token-guarded.

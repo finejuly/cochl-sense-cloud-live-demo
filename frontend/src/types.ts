@@ -65,10 +65,27 @@ export interface CollectedSegmentSummary {
 
 export interface LiveSessionEndResponse {
   session_id: string;
+  session_name?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
   segment_count: number;
   total_collected_duration_sec: number;
   kept_chunk_count: number;
   discarded_silent_chunk_count: number;
   discarded_speech_chunk_count: number;
   segments: CollectedSegmentSummary[];
+}
+
+export interface CollectedSessionInfo {
+  session_id: string;
+  session_name: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  segment_count: number;
+  total_collected_duration_sec: number;
+  segments: CollectedSegmentSummary[];
+}
+
+export interface CollectedSessionsResponse {
+  sessions: CollectedSessionInfo[];
 }

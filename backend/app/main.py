@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -24,10 +25,19 @@ from backend.app.audio import (
     validate_upload_size,
 )
 from backend.app.cochl_provider import CochlProvider
-from backend.app.collection import LiveCollectionManager, policy_from_settings
+from backend.app.collection import (
+    LiveCollectionManager,
+    delete_collected_segment,
+    delete_collected_session,
+    list_collected_sessions,
+    policy_from_settings,
+    safe_collected_session_dir,
+)
 from backend.app.config import Settings
 from backend.app.models import (
     AnalysisResponse,
+    CollectedSessionsResponse,
+    DeletionResponse,
     LiveChunkAnalysisResponse,
     LiveSessionEndResponse,
     SoundEvent,
@@ -45,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(current_app: FastAPI):
+    cleanup_orphan_live_chunks()
     try:
         yield
     finally:
@@ -52,6 +63,31 @@ async def lifespan(current_app: FastAPI):
             wait=False,
             cancel_futures=True,
         )
+
+
+def cleanup_orphan_live_chunks() -> None:
+    """Removes live chunk staging left behind by a previous process.
+
+    With collection enabled, `recordings/live/` only holds chunks awaiting
+    classification; anything there at startup is an orphan from a crashed or
+    restarted server. With collection disabled, live chunks are intentional
+    debug output and must be kept.
+    """
+    try:
+        settings = get_settings()
+    except Exception:
+        return
+    if not settings.collection_enabled:
+        return
+    live_root = DEFAULT_RECORDINGS_DIR / "live"
+    if not live_root.is_dir():
+        return
+    try:
+        shutil.rmtree(live_root)
+    except OSError:
+        logger.exception("Could not clean orphaned live chunk directory %s.", live_root)
+    else:
+        logger.info("Removed orphaned live chunk staging directory %s.", live_root)
 
 
 def create_app(frontend_dist: Path | None = DEFAULT_FRONTEND_DIST) -> FastAPI:
@@ -88,6 +124,29 @@ def create_app(frontend_dist: Path | None = DEFAULT_FRONTEND_DIST) -> FastAPI:
         end_live_session,
         methods=["POST"],
         response_model=LiveSessionEndResponse,
+    )
+    created_app.add_api_route(
+        "/api/collected-sessions",
+        get_collected_sessions,
+        methods=["GET"],
+        response_model=CollectedSessionsResponse,
+    )
+    created_app.add_api_route(
+        "/api/collected-sessions/{session_id}/files/{filename}",
+        get_collected_file,
+        methods=["GET"],
+    )
+    created_app.add_api_route(
+        "/api/collected-sessions/{session_id}",
+        remove_collected_session,
+        methods=["DELETE"],
+        response_model=DeletionResponse,
+    )
+    created_app.add_api_route(
+        "/api/collected-sessions/{session_id}/segments/{filename}",
+        remove_collected_segment,
+        methods=["DELETE"],
+        response_model=DeletionResponse,
     )
 
     if frontend_dist and (frontend_dist / "index.html").exists():
@@ -184,6 +243,7 @@ async def analyze_live_chunk(
     sequence_id: int = Form(...),
     window_start_sec: float = Form(...),
     window_end_sec: float = Form(...),
+    session_name: str = Form(""),
     settings: Settings = Depends(get_settings),
 ) -> LiveChunkAnalysisResponse:
     if not settings.cochl_project_key:
@@ -221,6 +281,7 @@ async def analyze_live_chunk(
                     window_end_sec=window_end_sec,
                     saved_path=saved_path,
                     events=sound_events,
+                    session_name=_clean_session_name(session_name),
                 )
             except Exception:
                 logger.exception(
@@ -251,10 +312,72 @@ async def analyze_live_chunk(
 async def end_live_session(
     request: Request,
     session_id: str = Form(...),
+    session_name: str = Form(""),
 ) -> LiveSessionEndResponse:
     manager: LiveCollectionManager = request.app.state.live_collection_manager
     safe_session_id = _safe_live_session_id(session_id)
-    return await run_in_threadpool(manager.end_session, safe_session_id)
+    return await run_in_threadpool(
+        manager.end_session,
+        safe_session_id,
+        _clean_session_name(session_name),
+    )
+
+
+def _collected_root() -> Path:
+    return DEFAULT_RECORDINGS_DIR / "collected"
+
+
+def _clean_session_name(session_name: str) -> str | None:
+    cleaned = session_name.strip()
+    return cleaned[:100] or None
+
+
+async def get_collected_sessions() -> CollectedSessionsResponse:
+    sessions = await run_in_threadpool(list_collected_sessions, _collected_root())
+    return CollectedSessionsResponse(sessions=sessions)
+
+
+COLLECTED_FILE_MEDIA_TYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".json": "application/json",
+}
+
+
+async def get_collected_file(session_id: str, filename: str) -> FileResponse:
+    session_dir = safe_collected_session_dir(_collected_root(), session_id)
+    media_type = COLLECTED_FILE_MEDIA_TYPES.get(Path(filename).suffix.lower())
+    if (
+        session_dir is None
+        or Path(filename).name != filename
+        or media_type is None
+        or not (session_dir / filename).is_file()
+    ):
+        raise HTTPException(status_code=404, detail="Collected file not found.")
+    return FileResponse(session_dir / filename, media_type=media_type)
+
+
+async def remove_collected_session(session_id: str) -> DeletionResponse:
+    deleted = await run_in_threadpool(
+        delete_collected_session,
+        _collected_root(),
+        session_id,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Collected session not found.")
+    return DeletionResponse()
+
+
+async def remove_collected_segment(session_id: str, filename: str) -> DeletionResponse:
+    deleted = await run_in_threadpool(
+        delete_collected_segment,
+        _collected_root(),
+        session_id,
+        filename,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Collected segment not found.")
+    return DeletionResponse()
 
 
 async def _collect_live_chunk(
@@ -266,10 +389,11 @@ async def _collect_live_chunk(
     window_end_sec: float,
     saved_path: Path,
     events: list[SoundEvent],
+    session_name: str | None = None,
 ) -> str:
     manager: LiveCollectionManager = current_app.state.live_collection_manager
     safe_session_id = saved_path.parent.name
-    output_dir = DEFAULT_RECORDINGS_DIR / "collected" / safe_session_id
+    output_dir = _collected_root() / safe_session_id
 
     def schedule_segment_conversion(wav_path: Path) -> None:
         schedule_live_chunk_conversion(current_app, wav_path)
@@ -280,6 +404,7 @@ async def _collect_live_chunk(
             output_dir=output_dir,
             policy=policy_from_settings(settings),
             mp3_scheduler=schedule_segment_conversion,
+            session_name=session_name,
             sequence_id=sequence_id,
             window_start_sec=window_start_sec,
             window_end_sec=window_end_sec,

@@ -878,3 +878,154 @@ h3 {
   font-size: 0.85rem;
   word-break: break-all;
 }
+
+.session-name-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.session-name-row label {
+  color: #52615d;
+  font-size: 0.92rem;
+  font-weight: 720;
+  white-space: nowrap;
+}
+
+.session-name-row input {
+  flex: 1;
+  min-width: 0;
+  max-width: 360px;
+  border: 1px solid #d7e2dd;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #ffffff;
+  color: #26332f;
+  font-size: 0.92rem;
+}
+
+.session-name-row input:focus {
+  outline: 2px solid rgba(15, 118, 110, 0.4);
+  border-color: #0f766e;
+}
+
+.collection-summary-session {
+  margin: 8px 0 0;
+  color: #26332f;
+  font-size: 0.95rem;
+}
+
+.collected-sessions {
+  border: 1px solid #d8e0dd;
+  border-radius: 8px;
+  margin-top: 16px;
+  padding: 18px 20px;
+  background: #ffffff;
+}
+
+.collected-sessions-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.collected-sessions-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #0f5f59;
+}
+
+.collected-sessions-title h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.collected-sessions-header button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.collected-sessions-empty,
+.collected-sessions-error {
+  margin: 12px 0 0;
+  color: #5d6a67;
+  font-size: 0.92rem;
+}
+
+.collected-sessions-error {
+  color: #991b1b;
+}
+
+.collected-session-list {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 12px;
+}
+
+.collected-session-item {
+  border: 1px solid #d7e2dd;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #f9fbfa;
+}
+
+.collected-session-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.collected-session-name {
+  margin: 0;
+  color: #083f3b;
+  font-weight: 720;
+  word-break: break-all;
+}
+
+.collected-session-meta {
+  margin: 4px 0 0;
+  color: #52615d;
+  font-size: 0.88rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.collected-session-summary button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.collected-segment-rows {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.collected-segment-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #e2eae6;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #ffffff;
+  font-size: 0.92rem;
+}
+
+.collected-segment-row audio {
+  height: 32px;
+  max-width: 260px;
+  flex: 1;
+  min-width: 180px;
+}

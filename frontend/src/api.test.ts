@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { analyzeLiveChunk, endLiveSession } from './api';
+import {
+  analyzeLiveChunk,
+  collectedFileUrl,
+  deleteCollectedSegment,
+  deleteCollectedSession,
+  endLiveSession,
+  fetchCollectedSessions,
+} from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -78,6 +85,21 @@ describe('endLiveSession', () => {
     expect(body.get('session_id')).toBe('session-abc');
   });
 
+  it('includes the session name when provided', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ session_id: 'session-abc' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await endLiveSession('session-abc', '사무실 소음');
+
+    const body = fetchMock.mock.calls[0][1]?.body as FormData;
+    expect(body.get('session_name')).toBe('사무실 소음');
+  });
+
   it('throws the backend detail message on failure', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(JSON.stringify({ detail: '세션 종료 실패' }), {
@@ -88,5 +110,47 @@ describe('endLiveSession', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(endLiveSession('session-abc')).rejects.toThrow('세션 종료 실패');
+  });
+});
+
+describe('collected session management', () => {
+  it('fetches the collected sessions listing', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ sessions: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchCollectedSessions();
+
+    expect(result).toEqual({ sessions: [] });
+    expect(fetchMock).toHaveBeenCalledWith('/api/collected-sessions');
+  });
+
+  it('deletes sessions and segments with encoded identifiers', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ status: 'deleted' })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await deleteCollectedSession('session a');
+    await deleteCollectedSegment('session a', 'segment 1.mp3');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/collected-sessions/session%20a',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/collected-sessions/session%20a/segments/segment%201.mp3',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
+
+  it('builds encoded collected file URLs', () => {
+    expect(collectedFileUrl('session a', 'segment 1.mp3')).toBe(
+      '/api/collected-sessions/session%20a/files/segment%201.mp3',
+    );
   });
 });

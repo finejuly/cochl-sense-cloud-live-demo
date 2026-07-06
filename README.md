@@ -60,9 +60,12 @@ While streaming, the backend collects only the chunks that contain meaningful so
 - Chunks whose events all fall below `COCHL_COLLECTION_CONFIDENCE_THRESHOLD` (or that have no events) are treated as silence and deleted.
 - Chunks containing privacy-sensitive labels (`COCHL_COLLECTION_EXCLUDE_LABEL_KEYWORDS`, e.g. speech, whispering, singing) are deleted, and a collected segment never spans across a speech region.
 - Kept chunks are merged (window overlap removed) into contiguous segments of at most `COCHL_COLLECTION_MAX_SEGMENT_SEC` (default 20 s) so each file stays a context-sized unit.
-- Segments are saved under `recordings/collected/<session-id>/` as audio (`segment-XXX-<start>-<end>.wav`, converted to MP3 when `ffmpeg` is available) plus a metadata JSON with the detected events, chunk sequence ids, and timing. A `session.json` summary is written when the session ends.
+- Segments are saved under `recordings/collected/<session-id>/` as audio (`segment-XXX-<start>-<end>.wav`, converted to MP3 when `ffmpeg` is available) plus a metadata JSON with the detected events, chunk sequence ids, timing, session name, and timestamps. A `session.json` summary (name, started/ended timestamps, stats) is written when the session ends.
+- `recordings/live/` is only a staging area while collection is enabled: chunks are deleted or merged as they are classified, the frontend waits for in-flight analyses to drain before ending the session, late responses for ended sessions are discarded (tombstones), and any orphans from a crashed process are removed at server startup.
 
-The dashboard shows live counts of collected/excluded chunks during recording, and a collection summary (segments, durations, labels) after pressing 완료, which calls `POST /api/live-session/end`.
+An optional session name can be entered before recording; it is stored in all collection metadata alongside the recording date/time. The dashboard shows live counts of collected/excluded chunks during recording, and a collection summary (name, date, segments, durations, labels) after pressing 완료, which calls `POST /api/live-session/end`.
+
+Collected data can be browsed and managed in the 수집된 데이터 panel at the bottom of the dashboard: sessions are listed with their name, date, and segments; each segment can be played inline, and segments or whole sessions can be deleted. The backing endpoints are `GET /api/collected-sessions`, `GET /api/collected-sessions/{id}/files/{filename}`, and `DELETE /api/collected-sessions/{id}[/segments/{filename}]`.
 
 Set `COCHL_COLLECTION_ENABLED=false` to restore the previous behavior of keeping every live chunk as MP3 debug files.
 

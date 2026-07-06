@@ -599,6 +599,190 @@ def test_analyze_live_chunk_discards_speech_chunks_for_privacy(tmp_path, monkeyp
     assert not (recordings_dir / "collected" / "speech-test").exists()
 
 
+def test_live_session_records_name_and_timestamps(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+
+    class DetectingProvider(FakeProvider):
+        def analyze_live_chunk(self, path):
+            return {
+                "sound_event_detection": {
+                    "status": "success",
+                    "results": [
+                        {
+                            "start_time_sec": 0.0,
+                            "end_time_sec": 1.0,
+                            "classes": [{"class": "Knock", "confidence": 0.8}],
+                        }
+                    ],
+                }
+            }
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    monkeypatch.setattr(
+        "backend.app.main.convert_live_chunk_to_mp3",
+        lambda wav_path: None,
+        raising=False,
+    )
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: DetectingProvider(settings)
+    client = TestClient(created_app)
+
+    try:
+        chunk_response = client.post(
+            "/api/analyze-live-chunk",
+            data={
+                "session_id": "named-test",
+                "sequence_id": "1",
+                "window_start_sec": "0.0",
+                "window_end_sec": "2.0",
+                "session_name": "  사무실 소음  ",
+            },
+            files={"file": ("chunk.wav", make_wav_bytes(0, 2), "audio/wav")},
+        )
+        end_response = client.post(
+            "/api/live-session/end",
+            data={"session_id": "named-test", "session_name": "사무실 소음"},
+        )
+    finally:
+        created_app.dependency_overrides.clear()
+        created_app.state.provider_factory = None
+
+    assert chunk_response.status_code == 200
+    summary = end_response.json()
+    assert summary["session_name"] == "사무실 소음"
+    assert summary["started_at"] is not None
+    assert summary["ended_at"] is not None
+    session_json = json.loads(
+        (recordings_dir / "collected" / "named-test" / "session.json").read_text("utf-8")
+    )
+    assert session_json["session_name"] == "사무실 소음"
+
+
+def test_collected_sessions_can_be_listed_served_and_deleted(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+
+    class DetectingProvider(FakeProvider):
+        def analyze_live_chunk(self, path):
+            return {
+                "sound_event_detection": {
+                    "status": "success",
+                    "results": [
+                        {
+                            "start_time_sec": 0.0,
+                            "end_time_sec": 1.0,
+                            "classes": [{"class": "Knock", "confidence": 0.8}],
+                        }
+                    ],
+                }
+            }
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    monkeypatch.setattr(
+        "backend.app.main.convert_live_chunk_to_mp3",
+        lambda wav_path: None,
+        raising=False,
+    )
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: DetectingProvider(settings)
+    client = TestClient(created_app)
+
+    try:
+        post_live_chunk(client, "manage-test", 1, 0, 2)
+        client.post(
+            "/api/live-session/end",
+            data={"session_id": "manage-test", "session_name": "관리 테스트"},
+        )
+
+        listing = client.get("/api/collected-sessions")
+        sessions = listing.json()["sessions"]
+        assert listing.status_code == 200
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert session["session_id"] == "manage-test"
+        assert session["session_name"] == "관리 테스트"
+        segment = session["segments"][0]
+
+        audio_response = client.get(
+            f"/api/collected-sessions/manage-test/files/{segment['audio_filename']}"
+        )
+        assert audio_response.status_code == 200
+        assert audio_response.headers["content-type"].startswith("audio/")
+
+        traversal_response = client.get(
+            "/api/collected-sessions/..%2F..%2Fmanage-test/files/secret.wav"
+        )
+        assert traversal_response.status_code == 404
+
+        segment_delete = client.delete(
+            f"/api/collected-sessions/manage-test/segments/{segment['audio_filename']}"
+        )
+        assert segment_delete.status_code == 200
+        assert client.get("/api/collected-sessions").json()["sessions"] == []
+
+        missing_delete = client.delete("/api/collected-sessions/manage-test")
+        assert missing_delete.status_code == 404
+    finally:
+        created_app.dependency_overrides.clear()
+        created_app.state.provider_factory = None
+
+
+def test_delete_collected_session_endpoint_removes_directory(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+    session_dir = recordings_dir / "collected" / "session-a"
+    session_dir.mkdir(parents=True)
+    (session_dir / "segment-001-0.000-2.000.wav").write_bytes(b"wav")
+    (session_dir / "segment-001-0.000-2.000.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    created_app = create_app(frontend_dist=None)
+    client = TestClient(created_app)
+
+    response = client.delete("/api/collected-sessions/session-a")
+
+    assert response.status_code == 200
+    assert not session_dir.exists()
+
+
+def test_startup_removes_orphaned_live_chunks_when_collection_enabled(
+    tmp_path,
+    monkeypatch,
+):
+    recordings_dir = tmp_path / "recordings"
+    orphan = recordings_dir / "live" / "old-session" / "chunk-000001.wav"
+    orphan.parent.mkdir(parents=True)
+    orphan.write_bytes(b"wav")
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    monkeypatch.setattr("backend.app.main.get_settings", override_settings)
+    created_app = create_app(frontend_dist=None)
+
+    with TestClient(created_app):
+        pass
+
+    assert not (recordings_dir / "live").exists()
+
+
+def test_startup_keeps_live_chunks_when_collection_disabled(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+    orphan = recordings_dir / "live" / "old-session" / "chunk-000001.wav"
+    orphan.parent.mkdir(parents=True)
+    orphan.write_bytes(b"wav")
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    monkeypatch.setattr(
+        "backend.app.main.get_settings",
+        override_settings_without_collection,
+    )
+    created_app = create_app(frontend_dist=None)
+
+    with TestClient(created_app):
+        pass
+
+    assert orphan.exists()
+
+
 def test_end_live_session_for_unknown_session_returns_empty_summary():
     created_app = create_app(frontend_dist=None)
     client = TestClient(created_app)
