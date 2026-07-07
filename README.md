@@ -60,6 +60,7 @@ While streaming, the backend collects only the chunks that contain meaningful so
 - Chunks whose events all fall below `COCHL_COLLECTION_CONFIDENCE_THRESHOLD` (or that have no events) are treated as silence and deleted.
 - Chunks containing privacy-sensitive labels (`COCHL_COLLECTION_EXCLUDE_LABEL_KEYWORDS`, e.g. speech, whispering, singing) are deleted, and a collected segment never spans across a speech region.
 - Kept chunks are merged (window overlap removed) into contiguous segments of at most `COCHL_COLLECTION_MAX_SEGMENT_SEC` (default 20 s) so each file stays a context-sized unit.
+- Segments shorter than `COCHL_COLLECTION_MIN_SEGMENT_SEC` (default 5 s) are padded with the surrounding silent chunks — leading and trailing background audio around a short detection — so short signals keep their acoustic context. Padding never crosses a speech boundary.
 - Segments are saved under `recordings/collected/<session-id>/` as audio (`segment-XXX-<start>-<end>.wav`, converted to MP3 when `ffmpeg` is available) plus a metadata JSON with the detected events, chunk sequence ids, timing, session name, and timestamps. A `session.json` summary (name, started/ended timestamps, stats) is written when the session ends.
 - `recordings/live/` is only a staging area while collection is enabled: chunks are deleted or merged as they are classified, the frontend waits for in-flight analyses to drain before ending the session, late responses for ended sessions are discarded (tombstones), and any orphans from a crashed process are removed at server startup.
 

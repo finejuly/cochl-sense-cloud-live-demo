@@ -173,15 +173,19 @@ function mergeTransitiveDuplicates(events: LiveTimelineEvent[]): LiveTimelineEve
   return merged;
 }
 
+// Cochl reports sustained sounds as consecutive ~1s result rows, so same-label
+// events that touch (or nearly touch) must chain into one continuous bar.
+// Real pauses surface as >= 1s of absence, which stays above this tolerance.
+const MERGE_GAP_TOLERANCE_SEC = 0.75;
+
 function areDuplicateEvents(left: LiveTimelineEvent, right: LiveTimelineEvent): boolean {
   if (left.label !== right.label) {
     return false;
   }
-  return rangesOverlap(left, right) || Math.abs(left.startTimeSec - right.startTimeSec) <= 0.75;
-}
-
-function rangesOverlap(left: LiveTimelineEvent, right: LiveTimelineEvent): boolean {
-  return left.startTimeSec < right.endTimeSec && right.startTimeSec < left.endTimeSec;
+  return (
+    left.startTimeSec <= right.endTimeSec + MERGE_GAP_TOLERANCE_SEC
+    && right.startTimeSec <= left.endTimeSec + MERGE_GAP_TOLERANCE_SEC
+  );
 }
 
 function mergeEvent(left: LiveTimelineEvent, right: LiveTimelineEvent): LiveTimelineEvent {

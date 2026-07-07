@@ -22,9 +22,20 @@ from backend.app.models import SoundEvent
 
 FRAMERATE = 100
 
+# min_segment_sec=0 disables context padding so structural tests stay focused;
+# padding behavior is covered by the dedicated min-length tests below.
 POLICY = CollectionPolicy(
     confidence_threshold=0.5,
     exclude_label_keywords=("speech", "whisper", "sing"),
+    min_segment_sec=0.0,
+    max_segment_sec=20.0,
+    reorder_hold_back_sec=100.0,
+)
+
+PADDING_POLICY = CollectionPolicy(
+    confidence_threshold=0.5,
+    exclude_label_keywords=("speech", "whisper", "sing"),
+    min_segment_sec=5.0,
     max_segment_sec=20.0,
     reorder_hold_back_sec=100.0,
 )
@@ -112,6 +123,7 @@ def test_policy_from_settings_maps_collection_fields():
     settings = Settings(
         cochl_project_key="key",
         collection_confidence_threshold=0.7,
+        collection_min_segment_sec=4.0,
         collection_max_segment_sec=15.0,
         collection_exclude_label_keywords=("speech",),
     )
@@ -119,6 +131,7 @@ def test_policy_from_settings_maps_collection_fields():
     policy = policy_from_settings(settings)
 
     assert policy.confidence_threshold == 0.7
+    assert policy.min_segment_sec == 4.0
     assert policy.max_segment_sec == 15.0
     assert policy.exclude_label_keywords == ("speech",)
 
@@ -230,6 +243,7 @@ def test_collector_splits_segments_at_max_duration(tmp_path):
     policy = CollectionPolicy(
         confidence_threshold=0.5,
         exclude_label_keywords=("speech",),
+        min_segment_sec=0.0,
         max_segment_sec=4.0,
         reorder_hold_back_sec=100.0,
     )
@@ -270,19 +284,108 @@ def test_collector_flushes_pending_chunks_once_watermark_passes(tmp_path):
     policy = CollectionPolicy(
         confidence_threshold=0.5,
         exclude_label_keywords=("speech",),
+        min_segment_sec=0.0,
         max_segment_sec=20.0,
         reorder_hold_back_sec=4.0,
     )
     collector = SegmentCollector("session-a", tmp_path / "collected", policy)
 
-    _, silent_path = add_chunk(collector, chunks_dir, 1, 0, 2, [])
+    _, speech_path = add_chunk(collector, chunks_dir, 1, 0, 2, [event("Speech", 0.9)])
     add_chunk(collector, chunks_dir, 2, 1, 3, [event()])
-    assert silent_path.exists()  # watermark 3 - 4 < 0 has not passed chunk-1 yet
+    assert speech_path.exists()  # watermark 3 - 4 < 0 has not passed chunk-1 yet
 
     add_chunk(collector, chunks_dir, 3, 2, 4, [event()])
 
     # Watermark reached 4 - 4 = 0 >= chunk-1 start, so it was processed and deleted.
-    assert not silent_path.exists()
+    assert not speech_path.exists()
+
+
+def test_short_signal_gets_leading_background_context(tmp_path):
+    chunks_dir = tmp_path / "live"
+    output_dir = tmp_path / "collected"
+    collector = SegmentCollector("session-a", output_dir, PADDING_POLICY)
+
+    add_chunk(collector, chunks_dir, 1, 0, 2, [])
+    add_chunk(collector, chunks_dir, 2, 1, 3, [])
+    add_chunk(collector, chunks_dir, 3, 2, 4, [])
+    add_chunk(collector, chunks_dir, 4, 3, 5, [event("Glass_break", 0.9)])
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 1
+    segment = summary.segments[0]
+    # A 2-second detection is padded backwards with silent context to >= 5s.
+    assert segment.start_sec == 0.0
+    assert segment.end_sec == 5.0
+    assert segment.duration_sec == 5.0
+    assert segment.labels == ["Glass_break"]
+    segment_path = output_dir / segment.audio_filename
+    assert read_wav_values(segment_path) == list(range(5 * FRAMERATE))
+    assert summary.discarded_silent_chunk_count == 0
+
+
+def test_short_signal_gets_trailing_background_context(tmp_path):
+    chunks_dir = tmp_path / "live"
+    output_dir = tmp_path / "collected"
+    collector = SegmentCollector("session-a", output_dir, PADDING_POLICY)
+
+    add_chunk(collector, chunks_dir, 1, 0, 2, [event("Glass_break", 0.9)])
+    for sequence_id, (start, end) in enumerate(
+        [(1, 3), (2, 4), (3, 5), (4, 6), (5, 7)], start=2
+    ):
+        add_chunk(collector, chunks_dir, sequence_id, start, end, [])
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 1
+    segment = summary.segments[0]
+    # Trailing silent chunks extend the segment until the 5-second minimum.
+    assert segment.start_sec == 0.0
+    assert segment.end_sec == 5.0
+    segment_path = output_dir / segment.audio_filename
+    assert read_wav_values(segment_path) == list(range(5 * FRAMERATE))
+    # The remaining buffered context was not needed and is discarded.
+    assert summary.discarded_silent_chunk_count == 2
+
+
+def test_context_padding_never_crosses_a_speech_boundary(tmp_path):
+    chunks_dir = tmp_path / "live"
+    collector = SegmentCollector("session-a", tmp_path / "collected", PADDING_POLICY)
+
+    add_chunk(collector, chunks_dir, 1, 0, 2, [])
+    _, speech_path = add_chunk(collector, chunks_dir, 2, 1, 3, [event("Speech", 0.9)])
+    add_chunk(collector, chunks_dir, 3, 2, 4, [])
+    add_chunk(collector, chunks_dir, 4, 3, 5, [event("Glass_break", 0.9)])
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 1
+    segment = summary.segments[0]
+    # Pre-roll may only reach back to the silent chunk after the speech chunk.
+    assert segment.start_sec == 2.0
+    assert segment.end_sec == 5.0
+    assert not speech_path.exists()
+    assert summary.discarded_speech_chunk_count == 1
+    assert summary.discarded_silent_chunk_count == 1
+
+
+def test_long_detection_is_not_padded_beyond_minimum(tmp_path):
+    chunks_dir = tmp_path / "live"
+    collector = SegmentCollector("session-a", tmp_path / "collected", PADDING_POLICY)
+
+    add_chunk(collector, chunks_dir, 1, 0, 2, [])
+    for sequence_id, (start, end) in enumerate(
+        [(1, 3), (2, 4), (3, 5), (4, 6), (5, 7)], start=2
+    ):
+        add_chunk(collector, chunks_dir, sequence_id, start, end, [event()])
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 1
+    segment = summary.segments[0]
+    # Already >= 5s of meaningful audio: only the immediate pre-roll is added.
+    assert segment.end_sec == 7.0
+    assert segment.duration_sec >= 5.0
 
 
 def test_collector_invokes_mp3_scheduler_for_finalized_segments(tmp_path):

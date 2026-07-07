@@ -48,6 +48,7 @@ class Settings:
     max_upload_mb: int = 25
     collection_enabled: bool = True
     collection_confidence_threshold: float = 0.5
+    collection_min_segment_sec: float = 5.0
     collection_max_segment_sec: float = 20.0
     collection_exclude_label_keywords: tuple[str, ...] = (
         DEFAULT_COLLECTION_EXCLUDE_LABEL_KEYWORDS
@@ -73,6 +74,9 @@ class Settings:
             ),
             collection_confidence_threshold=float(
                 os.getenv("COCHL_COLLECTION_CONFIDENCE_THRESHOLD", "0.5")
+            ),
+            collection_min_segment_sec=float(
+                os.getenv("COCHL_COLLECTION_MIN_SEGMENT_SEC", "5")
             ),
             collection_max_segment_sec=float(
                 os.getenv("COCHL_COLLECTION_MAX_SEGMENT_SEC", "20")
@@ -101,6 +105,12 @@ class Settings:
             raise ValueError("Collection confidence threshold must be between 0 and 1.")
         if self.collection_max_segment_sec <= 0:
             raise ValueError("Collection max segment length must be positive.")
+        if self.collection_min_segment_sec < 0:
+            raise ValueError("Collection min segment length cannot be negative.")
+        if self.collection_min_segment_sec > self.collection_max_segment_sec:
+            raise ValueError(
+                "Collection min segment length cannot exceed the max segment length."
+            )
 
     def enabled_services(self) -> list[str]:
         services: list[str] = []

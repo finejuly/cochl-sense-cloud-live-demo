@@ -106,6 +106,29 @@ describe('mergeLiveTimelineEvents', () => {
     });
   });
 
+  it('chains touching same-label events from consecutive windows into one long bar', () => {
+    let merged = mergeLiveTimelineEvents([], [event('Keyboard', 0, 1, 0.8)]);
+    merged = mergeLiveTimelineEvents(merged, [event('Keyboard', 1, 2, 0.85)]);
+    merged = mergeLiveTimelineEvents(merged, [event('Keyboard', 2, 3, 0.9)]);
+    merged = mergeLiveTimelineEvents(merged, [event('Keyboard', 3, 4, 0.7)]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      startTimeSec: 0,
+      endTimeSec: 4,
+      confidence: 0.9,
+    });
+  });
+
+  it('keeps same-label events separate when the silence gap exceeds the tolerance', () => {
+    const merged = mergeLiveTimelineEvents(
+      [event('Keyboard', 0, 1, 0.8)],
+      [event('Keyboard', 2, 3, 0.8)],
+    );
+
+    expect(merged).toHaveLength(2);
+  });
+
   it('sorts non-duplicate events by start, end, then label', () => {
     const merged = mergeLiveTimelineEvents(
       [event('Speech', 4, 5), event('Alarm', 1, 2)],

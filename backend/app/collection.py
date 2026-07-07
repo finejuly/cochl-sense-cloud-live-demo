@@ -35,6 +35,7 @@ _TIME_EPSILON_SEC = 1e-3
 class CollectionPolicy:
     confidence_threshold: float = 0.5
     exclude_label_keywords: tuple[str, ...] = ()
+    min_segment_sec: float = 5.0
     max_segment_sec: float = 20.0
     reorder_hold_back_sec: float = DEFAULT_REORDER_HOLD_BACK_SEC
 
@@ -43,6 +44,7 @@ def policy_from_settings(settings: Settings) -> CollectionPolicy:
     return CollectionPolicy(
         confidence_threshold=settings.collection_confidence_threshold,
         exclude_label_keywords=settings.collection_exclude_label_keywords,
+        min_segment_sec=settings.collection_min_segment_sec,
         max_segment_sec=settings.collection_max_segment_sec,
     )
 
@@ -110,6 +112,7 @@ class SegmentCollector:
         self._pending: list[_ChunkEntry] = []
         self._max_window_end_seen = 0.0
         self._segment_chunks: list[_ChunkEntry] = []
+        self._context_buffer: list[_ChunkEntry] = []
         self._segment_index = 0
         self._segments: list[CollectedSegmentSummary] = []
         self._kept_chunk_count = 0
@@ -158,6 +161,7 @@ class SegmentCollector:
             while self._pending:
                 self._process_entry(self._pending.pop(0))
             self._finalize_current_segment("session_end")
+            self._flush_context_buffer()
             summary = LiveSessionEndResponse(
                 session_id=self.session_id,
                 session_name=self.session_name,
@@ -177,15 +181,16 @@ class SegmentCollector:
         return summary
 
     def _process_entry(self, entry: _ChunkEntry) -> None:
-        if entry.decision == CHUNK_DISCARDED_SILENT:
-            self._discarded_silent_count += 1
-            self._delete_chunk_file(entry)
-            return
         if entry.decision == CHUNK_DISCARDED_SPEECH:
             self._discarded_speech_count += 1
             self._delete_chunk_file(entry)
-            # Never let one collected file span across a speech region.
+            # Never let one collected file span across a speech region, and
+            # never reuse audio adjacent to it as context for later segments.
+            self._flush_context_buffer()
             self._finalize_current_segment("speech_boundary")
+            return
+        if entry.decision == CHUNK_DISCARDED_SILENT:
+            self._handle_silent_entry(entry)
             return
 
         self._kept_chunk_count += 1
@@ -199,7 +204,84 @@ class SegmentCollector:
                 > self.policy.max_segment_sec + _TIME_EPSILON_SEC
             ):
                 self._finalize_current_segment("max_duration")
-        self._segment_chunks.append(entry)
+        if self._segment_chunks:
+            self._segment_chunks.append(entry)
+        else:
+            self._start_segment_with_context(entry)
+
+    def _handle_silent_entry(self, entry: _ChunkEntry) -> None:
+        """Silent chunks are kept around as background context, not just dropped.
+
+        A contiguous silent chunk extends an open segment that is still below
+        min_segment_sec (trailing padding); otherwise it waits in the context
+        buffer so it can become pre-roll for the next meaningful segment.
+        """
+        if self._segment_chunks:
+            current_end = max(chunk.window_end_sec for chunk in self._segment_chunks)
+            segment_start = min(chunk.window_start_sec for chunk in self._segment_chunks)
+            if (
+                entry.window_start_sec <= current_end + _TIME_EPSILON_SEC
+                and current_end - segment_start
+                < self.policy.min_segment_sec - _TIME_EPSILON_SEC
+                and entry.window_end_sec - segment_start
+                <= self.policy.max_segment_sec + _TIME_EPSILON_SEC
+            ):
+                self._segment_chunks.append(entry)
+                return
+        self._push_context(entry)
+
+    def _push_context(self, entry: _ChunkEntry) -> None:
+        if (
+            self._context_buffer
+            and entry.window_start_sec
+            > self._context_buffer[-1].window_end_sec + _TIME_EPSILON_SEC
+        ):
+            # The chain broke, so the buffered audio can never touch a future
+            # segment start — discard it.
+            self._flush_context_buffer()
+        self._context_buffer.append(entry)
+        while self._context_buffer and (
+            self._context_buffer[0].window_end_sec
+            < entry.window_end_sec - self.policy.min_segment_sec - _TIME_EPSILON_SEC
+        ):
+            dropped = self._context_buffer.pop(0)
+            self._discarded_silent_count += 1
+            self._delete_chunk_file(dropped)
+
+    def _start_segment_with_context(self, entry: _ChunkEntry) -> None:
+        chunks = [entry]
+        segment_start = entry.window_start_sec
+        segment_end = entry.window_end_sec
+        while self._context_buffer:
+            if (
+                segment_end - segment_start
+                >= self.policy.min_segment_sec - _TIME_EPSILON_SEC
+            ):
+                break
+            candidate = self._context_buffer[-1]
+            if candidate.window_end_sec + _TIME_EPSILON_SEC < segment_start:
+                break
+            if (
+                segment_end - candidate.window_start_sec
+                > self.policy.max_segment_sec + _TIME_EPSILON_SEC
+            ):
+                break
+            self._context_buffer.pop()
+            if candidate.window_start_sec >= segment_start - _TIME_EPSILON_SEC:
+                # Fully covered by audio the segment already has.
+                self._discarded_silent_count += 1
+                self._delete_chunk_file(candidate)
+                continue
+            chunks.insert(0, candidate)
+            segment_start = candidate.window_start_sec
+        self._flush_context_buffer()
+        self._segment_chunks = chunks
+
+    def _flush_context_buffer(self) -> None:
+        for chunk in self._context_buffer:
+            self._discarded_silent_count += 1
+            self._delete_chunk_file(chunk)
+        self._context_buffer = []
 
     def _finalize_current_segment(self, reason: str) -> None:
         chunks = self._segment_chunks
@@ -268,7 +350,7 @@ class SegmentCollector:
                 end_sec=round(end_sec, 3),
                 duration_sec=round(end_sec - start_sec, 3),
                 event_count=sum(len(chunk.events) for chunk in chunks),
-                labels=_sorted_unique_labels(chunks),
+                labels=_sorted_unique_labels(chunks, self.policy.confidence_threshold),
                 audio_filename=wav_path.name,
                 metadata_filename=metadata_path.name,
             )
@@ -420,8 +502,15 @@ def _write_wav(path: Path, audio: _MergedAudio) -> None:
         writer.writeframes(audio.frames)
 
 
-def _sorted_unique_labels(chunks: list[_ChunkEntry]) -> list[str]:
-    return sorted({event.label for chunk in chunks for event in chunk.events})
+def _sorted_unique_labels(chunks: list[_ChunkEntry], confidence_threshold: float) -> list[str]:
+    return sorted(
+        {
+            event.label
+            for chunk in chunks
+            for event in chunk.events
+            if event.confidence is None or event.confidence >= confidence_threshold
+        }
+    )
 
 
 class LiveCollectionManager:

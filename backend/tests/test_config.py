@@ -51,6 +51,7 @@ def test_collection_defaults_are_enabled_with_privacy_keywords():
 
     assert settings.collection_enabled is True
     assert settings.collection_confidence_threshold == 0.5
+    assert settings.collection_min_segment_sec == 5.0
     assert settings.collection_max_segment_sec == 20.0
     assert "speech" in settings.collection_exclude_label_keywords
 
@@ -74,4 +75,15 @@ def test_collection_validation_rejects_out_of_range_values():
         Settings(
             cochl_project_key="key",
             collection_max_segment_sec=0,
+        ).validate_collection()
+    with pytest.raises(ValueError):
+        Settings(
+            cochl_project_key="key",
+            collection_min_segment_sec=-1,
+        ).validate_collection()
+    with pytest.raises(ValueError):
+        Settings(
+            cochl_project_key="key",
+            collection_min_segment_sec=25,
+            collection_max_segment_sec=20,
         ).validate_collection()
