@@ -125,6 +125,7 @@ def test_policy_from_settings_maps_collection_fields():
         collection_confidence_threshold=0.7,
         collection_min_segment_sec=4.0,
         collection_max_segment_sec=15.0,
+        collection_silence_close_sec=2.0,
         collection_exclude_label_keywords=("speech",),
     )
 
@@ -133,6 +134,7 @@ def test_policy_from_settings_maps_collection_fields():
     assert policy.confidence_threshold == 0.7
     assert policy.min_segment_sec == 4.0
     assert policy.max_segment_sec == 15.0
+    assert policy.silence_close_sec == 2.0
     assert policy.exclude_label_keywords == ("speech",)
 
 
@@ -393,6 +395,62 @@ def test_context_padding_never_crosses_a_speech_boundary(tmp_path):
     assert not speech_path.exists()
     assert summary.discarded_speech_chunk_count == 1
     assert summary.discarded_silent_chunk_count == 1
+
+
+def test_sustained_silence_finalizes_the_segment_in_real_time(tmp_path):
+    chunks_dir = tmp_path / "live"
+    output_dir = tmp_path / "collected"
+    # No reorder hold-back so chunks process as they arrive, like a live
+    # session whose watermark has caught up.
+    realtime_policy = CollectionPolicy(
+        confidence_threshold=0.5,
+        exclude_label_keywords=("speech",),
+        min_segment_sec=5.0,
+        max_segment_sec=20.0,
+        silence_close_sec=3.0,
+        reorder_hold_back_sec=0.0,
+    )
+    collector = SegmentCollector("session-a", output_dir, realtime_policy)
+
+    add_chunk(collector, chunks_dir, 1, 0, 2, [event("Glass_break", 0.9)])
+    for sequence_id, (start, end) in enumerate(
+        [(1, 3), (2, 4), (3, 5), (4, 6)], start=2
+    ):
+        add_chunk(collector, chunks_dir, sequence_id, start, end, [])
+
+    # 3+ seconds of silence past the detection: the file exists BEFORE the
+    # session ends, and session.json already carries name/start metadata.
+    segment_files = list(output_dir.glob("segment-*.wav"))
+    assert len(segment_files) == 1
+    partial_summary = json.loads((output_dir / "session.json").read_text("utf-8"))
+    assert partial_summary["segment_count"] == 1
+    assert partial_summary["ended_at"] is None
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 1
+    assert summary.segments[0].start_sec == 0.0
+    assert summary.segments[0].end_sec == 5.0
+    final_summary = json.loads((output_dir / "session.json").read_text("utf-8"))
+    assert final_summary["ended_at"] is not None
+
+
+def test_brief_lull_does_not_split_an_ongoing_detection(tmp_path):
+    chunks_dir = tmp_path / "live"
+    collector = SegmentCollector("session-a", tmp_path / "collected", PADDING_POLICY)
+
+    for sequence_id, (start, end) in enumerate(
+        [(0, 2), (1, 3), (2, 4), (3, 5), (4, 6)], start=1
+    ):
+        add_chunk(collector, chunks_dir, sequence_id, start, end, [event()])
+    add_chunk(collector, chunks_dir, 6, 5, 7, [])  # one silent window (lull)
+    add_chunk(collector, chunks_dir, 7, 6, 8, [event()])
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 1
+    assert summary.segments[0].start_sec == 0.0
+    assert summary.segments[0].end_sec == 8.0
 
 
 def test_long_detection_is_not_padded_beyond_minimum(tmp_path):

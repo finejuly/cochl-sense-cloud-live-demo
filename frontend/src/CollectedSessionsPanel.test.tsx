@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CollectedSessionInfo } from './types';
@@ -115,6 +115,29 @@ describe('CollectedSessionsPanel', () => {
     rerender(<CollectedSessionsPanel refreshToken={1} />);
 
     await waitFor(() => expect(panelMocks.fetchCollectedSessions).toHaveBeenCalledTimes(2));
+  });
+
+  it('refreshes periodically while auto-refresh is enabled', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<CollectedSessionsPanel refreshToken={0} autoRefreshMs={1000} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(panelMocks.fetchCollectedSessions).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(panelMocks.fetchCollectedSessions).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(panelMocks.fetchCollectedSessions).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('deletes a session after confirmation and reloads', async () => {

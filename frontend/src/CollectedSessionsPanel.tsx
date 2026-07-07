@@ -11,17 +11,20 @@ import { formatTime } from './waveform';
 
 interface CollectedSessionsPanelProps {
   refreshToken: number;
+  autoRefreshMs?: number;
 }
 
-export function CollectedSessionsPanel({ refreshToken }: CollectedSessionsPanelProps) {
+export function CollectedSessionsPanel({ refreshToken, autoRefreshMs }: CollectedSessionsPanelProps) {
   const [sessions, setSessions] = useState<CollectedSessionInfo[]>([]);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const knownIdsRef = useRef<Set<string>>(new Set());
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
+    if (!silent) {
+      setLoading(true);
+    }
     setError(null);
     try {
       const response = await fetchCollectedSessions();
@@ -37,15 +40,30 @@ export function CollectedSessionsPanel({ refreshToken }: CollectedSessionsPanelP
         return next;
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : '수집 데이터를 불러오지 못했습니다.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : '수집 데이터를 불러오지 못했습니다.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     void load();
   }, [load, refreshToken]);
+
+  useEffect(() => {
+    if (!autoRefreshMs || autoRefreshMs <= 0) {
+      return;
+    }
+    // 녹음 중 실시간으로 확정되는 세그먼트가 목록에 바로 나타나도록 주기 갱신.
+    const interval = window.setInterval(() => {
+      void load({ silent: true });
+    }, autoRefreshMs);
+    return () => window.clearInterval(interval);
+  }, [autoRefreshMs, load]);
 
   function handleToggle(sessionId: string, event: SyntheticEvent<HTMLDetailsElement>) {
     const isOpen = event.currentTarget.open;

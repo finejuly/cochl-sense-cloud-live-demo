@@ -37,6 +37,7 @@ class CollectionPolicy:
     exclude_label_keywords: tuple[str, ...] = ()
     min_segment_sec: float = 5.0
     max_segment_sec: float = 20.0
+    silence_close_sec: float = 3.0
     reorder_hold_back_sec: float = DEFAULT_REORDER_HOLD_BACK_SEC
 
 
@@ -46,6 +47,7 @@ def policy_from_settings(settings: Settings) -> CollectionPolicy:
         exclude_label_keywords=settings.collection_exclude_label_keywords,
         min_segment_sec=settings.collection_min_segment_sec,
         max_segment_sec=settings.collection_max_segment_sec,
+        silence_close_sec=settings.collection_silence_close_sec,
     )
 
 
@@ -162,23 +164,26 @@ class SegmentCollector:
                 self._process_entry(self._pending.pop(0))
             self._finalize_current_segment("session_end")
             self._flush_context_buffer()
-            summary = LiveSessionEndResponse(
-                session_id=self.session_id,
-                session_name=self.session_name,
-                started_at=self.started_at.isoformat(),
-                ended_at=datetime.now(timezone.utc).isoformat(),
-                segment_count=len(self._segments),
-                total_collected_duration_sec=round(
-                    sum(segment.duration_sec for segment in self._segments), 3
-                ),
-                kept_chunk_count=self._kept_chunk_count,
-                discarded_silent_chunk_count=self._discarded_silent_count,
-                discarded_speech_chunk_count=self._discarded_speech_count,
-                segments=list(self._segments),
-            )
+            summary = self._build_summary(ended=True)
             self._write_session_summary(summary)
             self._cleanup_source_dirs()
         return summary
+
+    def _build_summary(self, *, ended: bool) -> LiveSessionEndResponse:
+        return LiveSessionEndResponse(
+            session_id=self.session_id,
+            session_name=self.session_name,
+            started_at=self.started_at.isoformat(),
+            ended_at=datetime.now(timezone.utc).isoformat() if ended else None,
+            segment_count=len(self._segments),
+            total_collected_duration_sec=round(
+                sum(segment.duration_sec for segment in self._segments), 3
+            ),
+            kept_chunk_count=self._kept_chunk_count,
+            discarded_silent_chunk_count=self._discarded_silent_count,
+            discarded_speech_chunk_count=self._discarded_speech_count,
+            segments=list(self._segments),
+        )
 
     def _process_entry(self, entry: _ChunkEntry) -> None:
         if entry.decision == CHUNK_DISCARDED_SPEECH:
@@ -213,14 +218,18 @@ class SegmentCollector:
         """Silent chunks are kept around as background context, not just dropped.
 
         A contiguous silent chunk extends an open segment that is still below
-        min_segment_sec (trailing padding); otherwise it waits in the context
-        buffer so it can become pre-roll for the next meaningful segment.
+        min_segment_sec (trailing padding). Once silence stretches
+        silence_close_sec past the last meaningful chunk, the open segment is
+        finalized right away so its file appears while recording continues.
+        Otherwise the chunk waits in the context buffer so it can become
+        pre-roll for the next meaningful segment.
         """
         if self._segment_chunks:
             current_end = max(chunk.window_end_sec for chunk in self._segment_chunks)
             segment_start = min(chunk.window_start_sec for chunk in self._segment_chunks)
+            contiguous = entry.window_start_sec <= current_end + _TIME_EPSILON_SEC
             if (
-                entry.window_start_sec <= current_end + _TIME_EPSILON_SEC
+                contiguous
                 and current_end - segment_start
                 < self.policy.min_segment_sec - _TIME_EPSILON_SEC
                 and entry.window_end_sec - segment_start
@@ -228,6 +237,19 @@ class SegmentCollector:
             ):
                 self._segment_chunks.append(entry)
                 return
+            last_kept_end = max(
+                chunk.window_end_sec
+                for chunk in self._segment_chunks
+                if chunk.decision == CHUNK_COLLECTED
+            )
+            if (
+                contiguous
+                and entry.window_end_sec - last_kept_end
+                >= self.policy.silence_close_sec - _TIME_EPSILON_SEC
+            ):
+                # The sound has been over for a while — write the file now
+                # instead of waiting for the next event or the session end.
+                self._finalize_current_segment("silence")
         self._push_context(entry)
 
     def _push_context(self, entry: _ChunkEntry) -> None:
@@ -384,6 +406,10 @@ class SegmentCollector:
                 self.mp3_scheduler(wav_path)
             except Exception:
                 logger.exception("Could not schedule MP3 conversion for %s.", wav_path)
+        if not self._ended:
+            # Keep session.json current so mid-recording listings show the
+            # session name and start time alongside the new segment.
+            self._write_session_summary(self._build_summary(ended=False))
 
     def _segment_metadata(
         self,

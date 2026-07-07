@@ -50,6 +50,7 @@ class Settings:
     collection_confidence_threshold: float = 0.5
     collection_min_segment_sec: float = 5.0
     collection_max_segment_sec: float = 20.0
+    collection_silence_close_sec: float = 3.0
     collection_exclude_label_keywords: tuple[str, ...] = (
         DEFAULT_COLLECTION_EXCLUDE_LABEL_KEYWORDS
     )
@@ -81,6 +82,9 @@ class Settings:
             collection_max_segment_sec=float(
                 os.getenv("COCHL_COLLECTION_MAX_SEGMENT_SEC", "20")
             ),
+            collection_silence_close_sec=float(
+                os.getenv("COCHL_COLLECTION_SILENCE_CLOSE_SEC", "3")
+            ),
             collection_exclude_label_keywords=parse_keyword_list(
                 os.getenv("COCHL_COLLECTION_EXCLUDE_LABEL_KEYWORDS"),
                 DEFAULT_COLLECTION_EXCLUDE_LABEL_KEYWORDS,
@@ -111,6 +115,8 @@ class Settings:
             raise ValueError(
                 "Collection min segment length cannot exceed the max segment length."
             )
+        if self.collection_silence_close_sec <= 0:
+            raise ValueError("Collection silence close time must be positive.")
 
     def enabled_services(self) -> list[str]:
         services: list[str] = []

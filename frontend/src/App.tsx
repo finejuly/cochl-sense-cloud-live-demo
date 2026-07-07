@@ -64,6 +64,7 @@ const LIVE_VIEWPORT_SEC = 20;
 const LIVE_SPECTROGRAM_FPS = 12;
 const LIVE_SPECTROGRAM_BINS = 64;
 const LIVE_HISTORY_LIMIT = 6;
+const LIVE_COLLECTED_REFRESH_MS = 5000;
 
 interface LiveCollectionCounts {
   collected: number;
@@ -729,7 +730,10 @@ export default function App() {
 
         {analysis && <AnalysisPanel analysis={analysis} recordingFile={recordingFile} />}
 
-        <CollectedSessionsPanel refreshToken={collectedRefreshToken} />
+        <CollectedSessionsPanel
+          refreshToken={collectedRefreshToken}
+          autoRefreshMs={status === 'recording' ? LIVE_COLLECTED_REFRESH_MS : undefined}
+        />
       </section>
     </main>
   );
