@@ -249,16 +249,43 @@ class SegmentCollector:
             self._delete_chunk_file(dropped)
 
     def _start_segment_with_context(self, entry: _ChunkEntry) -> None:
-        chunks = [entry]
-        segment_start = entry.window_start_sec
-        segment_end = entry.window_end_sec
+        # Split the min-length deficit across both sides: only half becomes
+        # leading pre-roll here, so trailing silence can fill the other half
+        # and the detection sits roughly centered. If the trailing side turns
+        # out short, _finalize_current_segment tops up from the leftovers.
+        entry_duration = entry.window_end_sec - entry.window_start_sec
+        lead_limit = max(0.0, (self.policy.min_segment_sec - entry_duration) / 2)
+        self._segment_chunks = self._prepend_context([entry], lead_limit=lead_limit)
+
+    def _prepend_context(
+        self,
+        chunks: list[_ChunkEntry],
+        lead_limit: float | None = None,
+    ) -> list[_ChunkEntry]:
+        segment_start = min(chunk.window_start_sec for chunk in chunks)
+        segment_end = max(chunk.window_end_sec for chunk in chunks)
+        anchor_start = segment_start
         while self._context_buffer:
             if (
                 segment_end - segment_start
                 >= self.policy.min_segment_sec - _TIME_EPSILON_SEC
             ):
                 break
+            if (
+                lead_limit is not None
+                and anchor_start - segment_start >= lead_limit - _TIME_EPSILON_SEC
+            ):
+                break
             candidate = self._context_buffer[-1]
+            if candidate.window_start_sec >= segment_start - _TIME_EPSILON_SEC:
+                if candidate.window_end_sec <= segment_end + _TIME_EPSILON_SEC:
+                    # Fully covered by audio the segment already has.
+                    self._context_buffer.pop()
+                    self._discarded_silent_count += 1
+                    self._delete_chunk_file(candidate)
+                    continue
+                # Context past the segment — pre-roll for the next one.
+                break
             if candidate.window_end_sec + _TIME_EPSILON_SEC < segment_start:
                 break
             if (
@@ -267,15 +294,9 @@ class SegmentCollector:
             ):
                 break
             self._context_buffer.pop()
-            if candidate.window_start_sec >= segment_start - _TIME_EPSILON_SEC:
-                # Fully covered by audio the segment already has.
-                self._discarded_silent_count += 1
-                self._delete_chunk_file(candidate)
-                continue
             chunks.insert(0, candidate)
             segment_start = candidate.window_start_sec
-        self._flush_context_buffer()
-        self._segment_chunks = chunks
+        return chunks
 
     def _flush_context_buffer(self) -> None:
         for chunk in self._context_buffer:
@@ -288,6 +309,9 @@ class SegmentCollector:
         self._segment_chunks = []
         if not chunks:
             return
+        # Trailing silence may have been too short — top the segment up to the
+        # minimum length from leftover leading context.
+        chunks = self._prepend_context(chunks)
 
         try:
             merged = _merge_chunk_audio(chunks)
