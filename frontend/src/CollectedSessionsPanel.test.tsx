@@ -78,6 +78,36 @@ describe('CollectedSessionsPanel', () => {
     );
   });
 
+  it('expands only the most recent session by default', async () => {
+    panelMocks.fetchCollectedSessions.mockResolvedValue({
+      sessions: [
+        sessionInfo({ session_id: 'session-new', session_name: '새 세션' }),
+        sessionInfo({ session_id: 'session-old', session_name: '옛 세션' }),
+      ],
+    });
+
+    const { container } = render(<CollectedSessionsPanel refreshToken={0} />);
+    await screen.findByText('새 세션');
+
+    const detailsElements = container.querySelectorAll('details');
+    expect(detailsElements).toHaveLength(2);
+    expect(detailsElements[0]).toHaveAttribute('open');
+    expect(detailsElements[1]).not.toHaveAttribute('open');
+  });
+
+  it('shows the session count in the header', async () => {
+    panelMocks.fetchCollectedSessions.mockResolvedValue({
+      sessions: [
+        sessionInfo({ session_id: 'session-new', session_name: '새 세션' }),
+        sessionInfo({ session_id: 'session-old', session_name: '옛 세션' }),
+      ],
+    });
+
+    render(<CollectedSessionsPanel refreshToken={0} />);
+
+    expect(await screen.findByText('2개 세션')).toBeInTheDocument();
+  });
+
   it('reloads the list when the refresh token changes', async () => {
     const { rerender } = render(<CollectedSessionsPanel refreshToken={0} />);
     await waitFor(() => expect(panelMocks.fetchCollectedSessions).toHaveBeenCalledTimes(1));

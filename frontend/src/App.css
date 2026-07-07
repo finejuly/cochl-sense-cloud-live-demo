@@ -960,26 +960,44 @@ h3 {
   color: #991b1b;
 }
 
+.collected-sessions-count {
+  color: #7a8683;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
 .collected-session-list {
   margin: 12px 0 0;
-  padding: 0;
+  padding: 2px;
   list-style: none;
   display: grid;
-  gap: 12px;
+  gap: 8px;
+  max-height: 420px;
+  overflow-y: auto;
 }
 
 .collected-session-item {
   border: 1px solid #d7e2dd;
   border-radius: 8px;
-  padding: 12px 14px;
   background: #f9fbfa;
 }
 
-.collected-session-summary {
+.collected-session-summary-row {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.collected-session-summary-row::marker {
+  color: #0f766e;
+}
+
+.collected-session-item[open] .collected-session-summary-row {
+  border-bottom: 1px solid #e2eae6;
 }
 
 .collected-session-name {
@@ -990,13 +1008,22 @@ h3 {
 }
 
 .collected-session-meta {
-  margin: 4px 0 0;
+  margin: 0;
   color: #52615d;
   font-size: 0.88rem;
   font-variant-numeric: tabular-nums;
 }
 
-.collected-session-summary button {
+.collected-session-body {
+  padding: 10px 14px 12px;
+}
+
+.collected-session-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.collected-session-actions button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1004,7 +1031,7 @@ h3 {
 }
 
 .collected-segment-rows {
-  margin: 10px 0 0;
+  margin: 8px 0 0;
   padding: 0;
   list-style: none;
   display: grid;

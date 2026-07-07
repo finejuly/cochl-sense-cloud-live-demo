@@ -728,6 +728,35 @@ def test_collected_sessions_can_be_listed_served_and_deleted(tmp_path, monkeypat
         created_app.state.provider_factory = None
 
 
+def test_collected_file_falls_back_to_converted_extension(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+    session_dir = recordings_dir / "collected" / "session-a"
+    session_dir.mkdir(parents=True)
+    # The WAV was already replaced by the async MP3 conversion.
+    (session_dir / "segment-001-0.000-4.000.mp3").write_bytes(b"mp3-audio")
+    (session_dir / "segment-001-0.000-4.000.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    created_app = create_app(frontend_dist=None)
+    client = TestClient(created_app)
+
+    stale_wav = client.get(
+        "/api/collected-sessions/session-a/files/segment-001-0.000-4.000.wav"
+    )
+    metadata = client.get(
+        "/api/collected-sessions/session-a/files/segment-001-0.000-4.000.json"
+    )
+    missing = client.get(
+        "/api/collected-sessions/session-a/files/segment-999-0.000-4.000.wav"
+    )
+
+    assert stale_wav.status_code == 200
+    assert stale_wav.headers["content-type"].startswith("audio/mpeg")
+    assert stale_wav.content == b"mp3-audio"
+    assert metadata.status_code == 200
+    assert missing.status_code == 404
+
+
 def test_delete_collected_session_endpoint_removes_directory(tmp_path, monkeypatch):
     recordings_dir = tmp_path / "recordings"
     session_dir = recordings_dir / "collected" / "session-a"

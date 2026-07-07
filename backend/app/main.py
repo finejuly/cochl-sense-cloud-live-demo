@@ -346,15 +346,28 @@ COLLECTED_FILE_MEDIA_TYPES = {
 
 async def get_collected_file(session_id: str, filename: str) -> FileResponse:
     session_dir = safe_collected_session_dir(_collected_root(), session_id)
-    media_type = COLLECTED_FILE_MEDIA_TYPES.get(Path(filename).suffix.lower())
     if (
         session_dir is None
         or Path(filename).name != filename
-        or media_type is None
-        or not (session_dir / filename).is_file()
+        or Path(filename).suffix.lower() not in COLLECTED_FILE_MEDIA_TYPES
     ):
         raise HTTPException(status_code=404, detail="Collected file not found.")
-    return FileResponse(session_dir / filename, media_type=media_type)
+
+    # Async MP3 conversion replaces a segment's WAV after it was listed, so a
+    # stale audio URL falls back to the sibling extension with the same stem.
+    stem = Path(filename).stem
+    candidates = [filename]
+    if Path(filename).suffix.lower() != ".json":
+        candidates += [
+            f"{stem}{suffix}"
+            for suffix in (".mp3", ".wav")
+            if f"{stem}{suffix}" != filename
+        ]
+    for candidate in candidates:
+        media_type = COLLECTED_FILE_MEDIA_TYPES.get(Path(candidate).suffix.lower())
+        if media_type and (session_dir / candidate).is_file():
+            return FileResponse(session_dir / candidate, media_type=media_type)
+    raise HTTPException(status_code=404, detail="Collected file not found.")
 
 
 async def remove_collected_session(session_id: str) -> DeletionResponse:
