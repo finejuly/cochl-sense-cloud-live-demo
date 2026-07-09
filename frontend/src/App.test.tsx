@@ -331,6 +331,10 @@ describe('App', () => {
       .mockResolvedValueOnce({
         ...liveResponse(3, [{ label: 'Speech', confidence: 0.9 }]),
         collection_status: 'discarded_speech',
+      })
+      .mockResolvedValueOnce({
+        ...liveResponse(4, []),
+        collection_status: 'discarded_late',
       });
 
     try {
@@ -342,10 +346,11 @@ describe('App', () => {
         appMocks.liveWindowCallbacks[0](liveWindow(0, 2));
         appMocks.liveWindowCallbacks[0](liveWindow(1, 3));
         appMocks.liveWindowCallbacks[0](liveWindow(2, 4));
+        appMocks.liveWindowCallbacks[0](liveWindow(3, 5));
       });
 
       expect(
-        await screen.findByText(/수집 1 · 무음 제외 1 · 음성 제외 1/),
+        await screen.findByText(/수집 1 · 무음 제외 1 · 음성 제외 1 · 종료 후 제외 1/),
       ).toBeInTheDocument();
     } finally {
       recording.restore();
@@ -467,6 +472,8 @@ describe('App', () => {
 
       expect(screen.getByText(/수집 데이터를 정리하고 있습니다/)).toBeInTheDocument();
       expect(appMocks.endLiveSession).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: /분석/i })).toBeDisabled();
+      expect(screen.getByRole('button', { name: /폐기/i })).toBeDisabled();
 
       await act(async () => {
         request.resolve(liveResponse(1, []));
@@ -656,7 +663,9 @@ describe('App', () => {
       await act(async () => {
         appMocks.liveWindowCallbacks[0](liveWindow(0, 2));
       });
+      const oldSignal = appMocks.analyzeLiveChunk.mock.calls[0][0].signal as AbortSignal;
       await userEvent.click(screen.getByRole('button', { name: /폐기/i }));
+      expect(oldSignal.aborted).toBe(true);
       await userEvent.click(screen.getByRole('button', { name: /녹음 시작/i }));
       await screen.findByText(/녹음 중/i);
 

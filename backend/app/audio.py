@@ -10,6 +10,14 @@ class UploadTooLargeError(ValueError):
     pass
 
 
+class EmptyUploadError(ValueError):
+    pass
+
+
+class DuplicateUploadError(ValueError):
+    pass
+
+
 class AudioConversionError(RuntimeError):
     pass
 

@@ -14,6 +14,23 @@ export interface LiveSpectrogramFrame {
   magnitudes: number[];
 }
 
+export function appendCompactedSpectrogramFrame(
+  frames: LiveSpectrogramFrame[],
+  frame: LiveSpectrogramFrame,
+  maxFrames: number,
+): LiveSpectrogramFrame[] {
+  const boundedMax = Math.max(2, Math.floor(maxFrames));
+  frames.push(frame);
+  if (frames.length <= boundedMax) {
+    return frames;
+  }
+
+  // Preserve the full time range while progressively reducing resolution in
+  // the oldest half. Recent frames remain at full capture resolution.
+  const compactUntil = Math.floor(frames.length / 2);
+  return frames.filter((_, index) => index >= compactUntil || index % 2 === 0);
+}
+
 export interface LiveAudioCaptureOptions {
   windowSec?: number;
   hopSec?: number;
@@ -105,11 +122,11 @@ export function encodePcm16Wav(samples: AudioSamples, sampleRate: number): Blob 
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
-export function createLiveAudioCapture(
+export async function createLiveAudioCapture(
   stream: MediaStream,
   onWindow: (window: LiveAudioWindow) => void,
   options: LiveAudioCaptureOptions = {},
-): () => void {
+): Promise<() => void> {
   const AudioContextCtor = getAudioContextConstructor();
   if (!AudioContextCtor) {
     throw new Error('Web Audio API is not supported.');
@@ -118,7 +135,6 @@ export function createLiveAudioCapture(
   const context = new AudioContextCtor();
   const source = context.createMediaStreamSource(stream);
   const analyser = context.createAnalyser();
-  const processor = context.createScriptProcessor(4096, 1, 1);
   const buffer = new LiveWindowBuffer({
     sampleRate: context.sampleRate,
     windowSec: options.windowSec ?? 2,
@@ -133,8 +149,7 @@ export function createLiveAudioCapture(
   analyser.fftSize = clampAnalyserFftSize(nextPowerOfTwo(spectrogramBins * 2));
   const frequencyData = new Uint8Array(analyser.frequencyBinCount);
 
-  processor.onaudioprocess = (event) => {
-    const input = event.inputBuffer.getChannelData(0);
+  const processSamples = (input: AudioSamples) => {
     totalCapturedSamples += input.length;
     buffer.push(input.slice(0)).forEach(onWindow);
 
@@ -150,12 +165,61 @@ export function createLiveAudioCapture(
     }
   };
 
+  let captureNode: AudioNode;
+  let detachCapture: () => void;
+  if (context.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+    const workletUrl = URL.createObjectURL(
+      new Blob([LIVE_CAPTURE_WORKLET_SOURCE], { type: 'text/javascript' }),
+    );
+    try {
+      await context.audioWorklet.addModule(workletUrl);
+    } catch (error) {
+      await context.close().catch(() => undefined);
+      throw error;
+    } finally {
+      URL.revokeObjectURL(workletUrl);
+    }
+    let worklet: AudioWorkletNode;
+    try {
+      worklet = new AudioWorkletNode(context, LIVE_CAPTURE_WORKLET_NAME, {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+    } catch (error) {
+      await context.close().catch(() => undefined);
+      throw error;
+    }
+    worklet.port.onmessage = (event: MessageEvent<Float32Array | ArrayBuffer>) => {
+      const samples = event.data instanceof Float32Array
+        ? event.data
+        : new Float32Array(event.data);
+      processSamples(samples);
+    };
+    captureNode = worklet;
+    detachCapture = () => {
+      worklet.port.onmessage = null;
+      worklet.port.close();
+    };
+  } else {
+    // Compatibility fallback for older WebViews. Supported browsers use the
+    // AudioWorklet path above so capture no longer runs on the render thread.
+    const processor = context.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (event) => {
+      processSamples(event.inputBuffer.getChannelData(0));
+    };
+    captureNode = processor;
+    detachCapture = () => {
+      processor.onaudioprocess = null;
+    };
+  }
+
   source.connect(analyser);
-  analyser.connect(processor);
-  processor.connect(context.destination);
+  analyser.connect(captureNode);
+  captureNode.connect(context.destination);
 
   return () => {
-    processor.onaudioprocess = null;
+    detachCapture();
     try {
       source.disconnect();
     } catch {
@@ -167,13 +231,48 @@ export function createLiveAudioCapture(
       // Ignore cleanup errors from already-disconnected nodes.
     }
     try {
-      processor.disconnect();
+      captureNode.disconnect();
     } catch {
       // Ignore cleanup errors from already-disconnected nodes.
     }
     void context.close().catch(() => undefined);
   };
 }
+
+const LIVE_CAPTURE_WORKLET_NAME = 'cochl-live-audio-capture';
+const LIVE_CAPTURE_WORKLET_SOURCE = `
+class CochlLiveAudioCaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buffer = new Float32Array(4096);
+    this.offset = 0;
+  }
+
+  process(inputs) {
+    const input = inputs[0] && inputs[0][0];
+    if (!input || input.length === 0) {
+      return true;
+    }
+
+    let sourceOffset = 0;
+    while (sourceOffset < input.length) {
+      const copyLength = Math.min(input.length - sourceOffset, this.buffer.length - this.offset);
+      this.buffer.set(input.subarray(sourceOffset, sourceOffset + copyLength), this.offset);
+      this.offset += copyLength;
+      sourceOffset += copyLength;
+      if (this.offset === this.buffer.length) {
+        const completed = this.buffer;
+        this.port.postMessage(completed, [completed.buffer]);
+        this.buffer = new Float32Array(4096);
+        this.offset = 0;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor('${LIVE_CAPTURE_WORKLET_NAME}', CochlLiveAudioCaptureProcessor);
+`;
 
 export function magnitudesFromFrequencyData(frequencyData: Uint8Array, binCount: number): number[] {
   if (!frequencyData.length || binCount <= 0) {

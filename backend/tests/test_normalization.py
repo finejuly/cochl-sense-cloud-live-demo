@@ -69,6 +69,39 @@ def test_missing_optional_services_are_empty():
     assert result.audio_insights is None
 
 
+def test_normalizes_string_boolean_values_without_truthiness_bug():
+    result = normalize_cochl_result(
+        {"audio_insights": {"result": {"contains_speech": "false"}}},
+        duration_sec=None,
+        content_type="audio/wav",
+        services_used=["audio_insights"],
+        processing_time_ms=1,
+    )
+
+    assert result.audio_insights is not None
+    assert result.audio_insights.contains_speech is False
+
+
+def test_replaces_non_finite_numeric_values():
+    events = normalize_sound_events(
+        {
+            "sound_event_detection": {
+                "results": [
+                    {
+                        "start_time_sec": "nan",
+                        "end_time_sec": "inf",
+                        "classes": [{"class": "Noise", "confidence": "nan"}],
+                    }
+                ]
+            }
+        }
+    )
+
+    assert events[0].start_time_sec == 0.0
+    assert events[0].end_time_sec == 0.0
+    assert events[0].confidence == 0.0
+
+
 def test_normalizes_live_sound_events_with_window_offset():
     raw = {
         "sound_event_detection": {

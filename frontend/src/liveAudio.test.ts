@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { LiveWindowBuffer, encodePcm16Wav, magnitudesFromFrequencyData } from './liveAudio';
+import {
+  LiveWindowBuffer,
+  appendCompactedSpectrogramFrame,
+  encodePcm16Wav,
+  magnitudesFromFrequencyData,
+  type LiveSpectrogramFrame,
+} from './liveAudio';
 
 describe('LiveWindowBuffer', () => {
   it('emits overlapping windows only after enough samples arrive', () => {
@@ -72,6 +78,25 @@ describe('magnitudesFromFrequencyData', () => {
   it('returns an empty array for empty input or non-positive bin counts', () => {
     expect(magnitudesFromFrequencyData(Uint8Array.from([]), 2)).toEqual([]);
     expect(magnitudesFromFrequencyData(Uint8Array.from([1, 2, 3]), 0)).toEqual([]);
+  });
+});
+
+describe('appendCompactedSpectrogramFrame', () => {
+  it('bounds memory while preserving the full time range and recent resolution', () => {
+    let frames: LiveSpectrogramFrame[] = [];
+
+    for (let timestampSec = 0; timestampSec <= 20; timestampSec += 1) {
+      frames = appendCompactedSpectrogramFrame(
+        frames,
+        { timestampSec, magnitudes: [timestampSec / 20] },
+        8,
+      );
+    }
+
+    expect(frames.length).toBeLessThanOrEqual(8);
+    expect(frames[0].timestampSec).toBe(0);
+    expect(frames.at(-1)?.timestampSec).toBe(20);
+    expect(frames.slice(-3).map((frame) => frame.timestampSec)).toEqual([18, 19, 20]);
   });
 });
 

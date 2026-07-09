@@ -12,6 +12,7 @@ export interface AnalyzeLiveChunkInput {
   windowStartSec: number;
   windowEndSec: number;
   sessionName?: string;
+  signal?: AbortSignal;
 }
 
 export async function analyzeRecording(file: File): Promise<AnalysisResponse> {
@@ -45,6 +46,7 @@ export async function analyzeLiveChunk(input: AnalyzeLiveChunkInput): Promise<Li
   const response = await fetch('/api/analyze-live-chunk', {
     method: 'POST',
     body: formData,
+    signal: input.signal,
   });
 
   if (!response.ok) {

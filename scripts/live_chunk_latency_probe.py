@@ -9,6 +9,7 @@ import sys
 import time
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass
@@ -67,7 +68,16 @@ def main() -> int:
         f"mode={args.mode} count={args.count} interval={args.interval_sec}s "
         f"max_in_flight={args.max_in_flight} audio={audio_path}"
     )
-    rows = run_schedule(args, runner, session_id)
+    rows: list[ProbeRow] = []
+    finish_error = ""
+    try:
+        rows = run_schedule(args, runner, session_id)
+    finally:
+        try:
+            runner.finish(session_id)
+        except Exception as exc:
+            finish_error = str(exc)
+            print(f"Could not finalize probe session: {finish_error}", file=sys.stderr)
     rows.sort(key=lambda row: row.sequence_id)
 
     csv_path = args.csv_path
@@ -76,7 +86,7 @@ def main() -> int:
         print(f"Wrote CSV: {csv_path.expanduser().resolve()}")
 
     print_summary(rows)
-    return 0 if all(row.status in {"OK", "SKIP"} for row in rows) else 1
+    return 0 if not finish_error and all(row.status in {"OK", "SKIP"} for row in rows) else 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,7 +131,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--session-id", default="", help="Session id sent to local API.")
     parser.add_argument("--csv", dest="csv_path", type=Path, help="Optional CSV output path.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.count <= 0:
+        parser.error("--count must be positive")
+    if args.interval_sec <= 0:
+        parser.error("--interval-sec must be positive")
+    if args.window_sec <= 0:
+        parser.error("--window-sec must be positive")
+    if args.max_in_flight <= 0:
+        parser.error("--max-in-flight must be positive")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    return args
 
 
 def run_schedule(args: argparse.Namespace, runner: "ProbeRunner", session_id: str) -> list[ProbeRow]:
@@ -208,6 +229,9 @@ class ProbeRunner:
     ) -> ProbeRow:
         raise NotImplementedError
 
+    def finish(self, session_id: str) -> None:
+        return None
+
 
 class DirectCochlRunner(ProbeRunner):
     def __init__(self, audio_path: Path):
@@ -285,6 +309,7 @@ class LocalApiRunner(ProbeRunner):
         self.audio_path = audio_path
         self.audio_bytes = audio_path.read_bytes()
         self.url = url
+        self.end_url = live_session_end_url(url)
         self.timeout = timeout
 
     def send(
@@ -362,6 +387,30 @@ class LocalApiRunner(ProbeRunner):
             row.request_ms = round_ms((time.perf_counter() - request_start) * 1000)
             row.error = str(exc)
         return row
+
+    def finish(self, session_id: str) -> None:
+        body = urllib.parse.urlencode({"session_id": session_id}).encode("utf-8")
+        request = urllib.request.Request(
+            self.end_url,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            response.read()
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(
+                    f"Live session finalization returned HTTP {response.status}."
+                )
+
+
+def live_session_end_url(analyze_url: str) -> str:
+    parsed = urllib.parse.urlsplit(analyze_url)
+    api_root = parsed.path.rstrip("/").rsplit("/", 1)[0]
+    end_path = f"{api_root}/live-session/end"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, end_path, "", "")
+    )
 
 
 def multipart_body(

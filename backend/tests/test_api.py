@@ -88,6 +88,100 @@ def test_analyze_recording_returns_normalized_result():
     assert response.json()["sound_events"][0]["label"] == "Speech"
 
 
+def test_empty_uploads_return_bad_request(tmp_path, monkeypatch):
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", tmp_path / "recordings")
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: FakeProvider(settings)
+    client = TestClient(created_app)
+
+    recording_response = client.post(
+        "/api/analyze-recording",
+        files={"file": ("empty.wav", b"", "audio/wav")},
+    )
+    live_response = client.post(
+        "/api/analyze-live-chunk",
+        data={
+            "session_id": "empty-test",
+            "sequence_id": "1",
+            "window_start_sec": "0",
+            "window_end_sec": "2",
+        },
+        files={"file": ("empty.wav", b"", "audio/wav")},
+    )
+
+    assert recording_response.status_code == 400
+    assert live_response.status_code == 400
+    assert not any((tmp_path / "recordings").rglob("*.wav"))
+
+
+def test_recording_provider_does_not_block_other_requests(tmp_path, monkeypatch):
+    delay_sec = 0.3
+
+    class SlowRecordingProvider(FakeProvider):
+        def analyze_file(self, path):
+            time.sleep(delay_sec)
+            return {}
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", tmp_path / "recordings")
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: SlowRecordingProvider(settings)
+
+    async def run_requests():
+        transport = httpx.ASGITransport(app=created_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            started_at = time.perf_counter()
+            recording_request = asyncio.create_task(
+                client.post(
+                    "/api/analyze-recording",
+                    files={"file": ("clip.wav", b"wav-audio", "audio/wav")},
+                )
+            )
+            await asyncio.sleep(0.02)
+            health_response = await client.get("/api/health")
+            health_elapsed_sec = time.perf_counter() - started_at
+            recording_response = await recording_request
+        return health_elapsed_sec, health_response, recording_response
+
+    health_elapsed_sec, health_response, recording_response = asyncio.run(run_requests())
+
+    assert health_response.status_code == 200
+    assert health_elapsed_sec < delay_sec / 2
+    assert recording_response.status_code == 200
+
+
+def test_failed_live_analysis_removes_staged_audio_when_collection_is_enabled(
+    tmp_path,
+    monkeypatch,
+):
+    recordings_dir = tmp_path / "recordings"
+
+    class FailingProvider(FakeProvider):
+        def analyze_live_chunk(self, path):
+            raise RuntimeError("provider failed")
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: FailingProvider(settings)
+    client = TestClient(created_app)
+
+    response = client.post(
+        "/api/analyze-live-chunk",
+        data={
+            "session_id": "failure-cleanup-test",
+            "sequence_id": "1",
+            "window_start_sec": "0",
+            "window_end_sec": "2",
+        },
+        files={"file": ("chunk.wav", b"wav-audio", "audio/wav")},
+    )
+
+    assert response.status_code == 502
+    assert not any(recordings_dir.rglob("*.wav"))
+
+
 def test_analyze_recording_uses_provider_factory_from_created_app():
     created_app = create_app(frontend_dist=None)
     created_app.dependency_overrides[get_settings] = override_settings
@@ -305,7 +399,7 @@ def test_schedule_live_chunk_conversion_skips_when_backlog_is_full(tmp_path):
     assert len(created_app.state.live_conversion_futures) == LIVE_CONVERSION_MAX_PENDING
 
 
-def test_analyze_live_chunk_sanitizes_session_id(tmp_path, monkeypatch):
+def test_analyze_live_chunk_rejects_ambiguous_session_id(tmp_path, monkeypatch):
     recordings_dir = tmp_path / "recordings"
     provider_paths = []
 
@@ -340,13 +434,52 @@ def test_analyze_live_chunk_sanitizes_session_id(tmp_path, monkeypatch):
         created_app.dependency_overrides.clear()
         created_app.state.provider_factory = None
 
-    live_root = recordings_dir / "live"
-    assert response.status_code == 200
-    assert len(provider_paths) == 1
-    saved_path = provider_paths[0]
-    assert saved_path.is_relative_to(live_root)
-    assert ".." not in saved_path.parts
-    assert saved_path.parent.name == "_bad_session"
+    assert response.status_code == 422
+    assert provider_paths == []
+    assert not recordings_dir.exists()
+
+
+def test_analyze_live_chunk_rejects_invalid_window_metadata(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: FakeProvider(settings)
+    client = TestClient(created_app)
+
+    response = client.post(
+        "/api/analyze-live-chunk",
+        data={
+            "session_id": "metadata-test",
+            "sequence_id": "0",
+            "window_start_sec": "2",
+            "window_end_sec": "1",
+        },
+        files={"file": ("chunk.wav", b"wav-audio", "audio/wav")},
+    )
+
+    assert response.status_code == 422
+    assert not recordings_dir.exists()
+
+
+def test_oversized_upload_is_streamed_and_partial_file_is_removed(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = lambda: Settings(
+        cochl_project_key="test-key",
+        max_upload_mb=1,
+    )
+    created_app.state.provider_factory = lambda settings: FakeProvider(settings)
+    client = TestClient(created_app)
+
+    response = client.post(
+        "/api/analyze-recording",
+        files={"file": ("large.wav", b"x" * (1024 * 1024 + 1), "audio/wav")},
+    )
+
+    assert response.status_code == 413
+    assert not any(recordings_dir.iterdir())
 
 
 def test_analyze_live_chunk_handles_concurrent_provider_calls(tmp_path, monkeypatch):
@@ -827,6 +960,51 @@ def test_end_live_session_for_unknown_session_returns_empty_summary():
     assert summary["segment_count"] == 0
     assert summary["kept_chunk_count"] == 0
     assert summary["segments"] == []
+
+
+def test_late_chunk_is_reported_as_discarded_after_session_end(tmp_path, monkeypatch):
+    recordings_dir = tmp_path / "recordings"
+
+    class EmptyProvider(FakeProvider):
+        def analyze_live_chunk(self, path):
+            return {"sound_event_detection": {"status": "success", "results": []}}
+
+    monkeypatch.setattr("backend.app.main.DEFAULT_RECORDINGS_DIR", recordings_dir)
+    created_app = create_app(frontend_dist=None)
+    created_app.dependency_overrides[get_settings] = override_settings
+    created_app.state.provider_factory = lambda settings: EmptyProvider(settings)
+    client = TestClient(created_app)
+
+    end_response = client.post(
+        "/api/live-session/end",
+        data={"session_id": "late-status-test"},
+    )
+    chunk_response = client.post(
+        "/api/analyze-live-chunk",
+        data={
+            "session_id": "late-status-test",
+            "sequence_id": "1",
+            "window_start_sec": "0",
+            "window_end_sec": "2",
+        },
+        files={"file": ("chunk.wav", make_wav_bytes(0, 2), "audio/wav")},
+    )
+
+    assert end_response.status_code == 200
+    assert chunk_response.status_code == 200
+    assert chunk_response.json()["collection_status"] == "discarded_late"
+    assert not any(recordings_dir.rglob("*.wav"))
+
+
+def test_end_live_session_rejects_invalid_session_id():
+    client = TestClient(create_app(frontend_dist=None))
+
+    response = client.post(
+        "/api/live-session/end",
+        data={"session_id": "../ambiguous"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_create_app_serves_built_frontend(tmp_path):

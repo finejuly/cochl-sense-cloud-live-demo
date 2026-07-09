@@ -4,6 +4,7 @@ import wave
 
 from backend.app.collection import (
     CHUNK_COLLECTED,
+    CHUNK_DISCARDED_LATE,
     CHUNK_DISCARDED_SILENT,
     CHUNK_DISCARDED_SPEECH,
     CollectionPolicy,
@@ -494,7 +495,7 @@ def test_collector_deletes_late_chunks_after_session_end(tmp_path):
 
     decision, late_path = add_chunk(collector, chunks_dir, 9, 8, 10, [event()])
 
-    assert decision == CHUNK_COLLECTED
+    assert decision == CHUNK_DISCARDED_LATE
     assert not late_path.exists()
 
 
@@ -558,7 +559,7 @@ def test_manager_deletes_late_chunks_for_ended_sessions(tmp_path):
         events=[event()],
     )
 
-    assert decision == CHUNK_COLLECTED
+    assert decision == CHUNK_DISCARDED_LATE
     assert not late_wav.exists()
     assert not late_wav.parent.exists()
     assert "session-a" not in manager._collectors

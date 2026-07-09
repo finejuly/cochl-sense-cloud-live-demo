@@ -41,7 +41,11 @@ export interface AnalysisResponse {
   usage: UsageMetadata;
 }
 
-export type LiveChunkCollectionStatus = 'collected' | 'discarded_silent' | 'discarded_speech';
+export type LiveChunkCollectionStatus =
+  | 'collected'
+  | 'discarded_silent'
+  | 'discarded_speech'
+  | 'discarded_late';
 
 export interface LiveChunkAnalysisResponse {
   sequence_id: number;

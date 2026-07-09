@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 CHUNK_COLLECTED = "collected"
 CHUNK_DISCARDED_SILENT = "discarded_silent"
 CHUNK_DISCARDED_SPEECH = "discarded_speech"
+CHUNK_DISCARDED_LATE = "discarded_late"
 
 DEFAULT_REORDER_HOLD_BACK_SEC = 6.0
 DEFAULT_STALE_SESSION_SEC = 600.0
@@ -147,7 +148,7 @@ class SegmentCollector:
                 # Late chunk after the session was finalized: apply the
                 # decision standalone so the file never lingers unbounded.
                 self._delete_chunk_file(entry)
-                return decision
+                return CHUNK_DISCARDED_LATE
             self.last_activity_monotonic = monotonic()
             self._source_dirs.add(wav_path.parent)
             insort(self._pending, entry)
@@ -595,7 +596,7 @@ class LiveCollectionManager:
             self._prune_tombstones()
             if session_id in self._ended_sessions:
                 _discard_late_chunk(wav_path)
-                return classify_chunk_events(events, policy)
+                return CHUNK_DISCARDED_LATE
             collector = self._collectors.get(session_id)
             if collector is None:
                 collector = SegmentCollector(

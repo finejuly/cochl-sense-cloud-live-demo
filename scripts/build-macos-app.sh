@@ -5,7 +5,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$ROOT/CochlSenseCloudLiveDemo.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
-MODULE_CACHE_DIR="$ROOT/.build/clang-module-cache"
+# Clang module cache entries embed their absolute cache path. Keeping the cache
+# inside a movable project directory can make a copied/renamed checkout fail
+# with a PCH path mismatch, so use a stable per-user temporary location.
+MODULE_CACHE_DIR="${TMPDIR:-/tmp}/cochl-sense-cloud-live-demo-clang-module-cache"
 
 if ! command -v clang >/dev/null 2>&1; then
   echo "clang was not found. Install Xcode Command Line Tools first."

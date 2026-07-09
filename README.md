@@ -51,6 +51,8 @@ The Vite dev server proxies `/api` requests to `http://127.0.0.1:8000`.
 
 While recording, the frontend uses Web Audio to create 2-second WAV chunks and sends them to `/api/analyze-live-chunk` every second. The dashboard displays the live spectrogram, detected event markers, per-chunk states (`PENDING`, `DETECTED`, `EMPTY`, `FAIL`, `SKIP`), and request/server/window latency.
 
+Audio capture uses `AudioWorklet` when available, and old spectrogram history is progressively compacted so long-running sessions stay bounded without losing the overall time range. Each live request has a 60-second client timeout; pressing 완료 waits for every submitted request to settle before closing the collection session.
+
 After recording, the full audio file can be analyzed through `/api/analyze-recording` and shown as a separate result timeline. Live chunk records can also be exported as CSV for latency analysis.
 
 ## Data Collection
@@ -64,12 +66,15 @@ While streaming, the backend collects only the chunks that contain meaningful so
 - Segment files are written **in real time**: once silence stretches `COCHL_COLLECTION_SILENCE_CLOSE_SEC` (default 3 s) past the last detection, the open segment is finalized immediately — no need to wait for the recording to end. Brief one-window lulls do not split an ongoing sound. `session.json` is refreshed on every finalize, and the dashboard's 수집된 데이터 panel auto-refreshes every 5 s while recording so new files appear live.
 - Segments are saved under `recordings/collected/<session-id>/` as audio (`segment-XXX-<start>-<end>.wav`, converted to MP3 when `ffmpeg` is available) plus a metadata JSON with the detected events, chunk sequence ids, timing, session name, and timestamps. A `session.json` summary (name, started/ended timestamps, stats) is written when the session ends.
 - `recordings/live/` is only a staging area while collection is enabled: chunks are deleted or merged as they are classified, the frontend waits for in-flight analyses to drain before ending the session, late responses for ended sessions are discarded (tombstones), and any orphans from a crashed process are removed at server startup.
+- Live session ids must start with an ASCII letter or number and may then contain letters, numbers, dots, underscores, or hyphens, up to 128 characters. Invalid ids are rejected rather than rewritten, preventing two different ids from sharing a collection directory.
 
 An optional session name can be entered before recording; it is stored in all collection metadata alongside the recording date/time. The dashboard shows live counts of collected/excluded chunks during recording, and a collection summary (name, date, segments, durations, labels) after pressing 완료, which calls `POST /api/live-session/end`.
 
 Collected data can be browsed and managed in the 수집된 데이터 panel at the bottom of the dashboard: sessions are listed with their name, date, and segments; each segment can be played inline, and segments or whole sessions can be deleted. The backing endpoints are `GET /api/collected-sessions`, `GET /api/collected-sessions/{id}/files/{filename}`, and `DELETE /api/collected-sessions/{id}[/segments/{filename}]`.
 
 Set `COCHL_COLLECTION_ENABLED=false` to restore the previous behavior of keeping every live chunk as MP3 debug files.
+
+The latency probe finalizes its local live session before exiting, including when a scheduled request fails, so reorder-buffered chunks are not stranded.
 
 ## macOS App
 
@@ -93,6 +98,7 @@ npm run build
 - Collected live segments are saved under `recordings/collected/<session-id>/`; discarded (silent/speech) live chunks are deleted.
 - With `COCHL_COLLECTION_ENABLED=false`, live chunk debug files are kept under `recordings/live/<session-id>/` instead.
 - If the browser records WebM, the backend tries to convert it to WAV with `ffmpeg`.
+- Uploads are copied to disk in bounded chunks and rejected as soon as `MAX_UPLOAD_MB` is exceeded.
 
 ## License
 

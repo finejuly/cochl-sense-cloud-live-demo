@@ -9,6 +9,9 @@
 @property(nonatomic, strong) NSTask *serverTask;
 @property(nonatomic, strong) NSMutableString *outputBuffer;
 @property(nonatomic, strong) NSURL *projectRoot;
+@property(nonatomic, copy) NSString *serverScheme;
+@property(nonatomic, copy) NSString *serverHost;
+@property(nonatomic, assign) NSInteger serverPort;
 @property(nonatomic, assign) BOOL isQuitting;
 @end
 
@@ -56,11 +59,36 @@
     initiatedByFrame:(WKFrameInfo *)frame
     type:(WKMediaCaptureType)type
     decisionHandler:(void (^)(WKPermissionDecision decision))decisionHandler {
-  if (type == WKMediaCaptureTypeMicrophone || type == WKMediaCaptureTypeCameraAndMicrophone) {
+  BOOL isAllowedOrigin = self.serverScheme.length > 0 &&
+    origin.protocol.length > 0 &&
+    origin.host.length > 0 &&
+    [origin.protocol caseInsensitiveCompare:self.serverScheme] == NSOrderedSame &&
+    [origin.host caseInsensitiveCompare:self.serverHost] == NSOrderedSame &&
+    origin.port == self.serverPort;
+  if (type == WKMediaCaptureTypeMicrophone && isAllowedOrigin) {
     decisionHandler(WKPermissionDecisionGrant);
     return;
   }
-  decisionHandler(WKPermissionDecisionPrompt);
+  decisionHandler(WKPermissionDecisionDeny);
+}
+
+- (void)webView:(WKWebView *)webView
+    decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction
+    decisionHandler:(void (^)(WKNavigationActionPolicy policy))decisionHandler {
+  NSURL *url = navigationAction.request.URL;
+  NSString *scheme = url.scheme.lowercaseString;
+  BOOL isInitialPage = [scheme isEqualToString:@"about"];
+  BOOL isBlobUrl = [scheme isEqualToString:@"blob"];
+  BOOL isServerOrigin = self.serverScheme.length > 0 &&
+    url.host.length > 0 &&
+    [scheme isEqualToString:self.serverScheme.lowercaseString] &&
+    [url.host caseInsensitiveCompare:self.serverHost] == NSOrderedSame &&
+    (url.port ? url.port.integerValue : 80) == self.serverPort;
+  decisionHandler(
+    (isInitialPage || isBlobUrl || isServerOrigin)
+      ? WKNavigationActionPolicyAllow
+      : WKNavigationActionPolicyCancel
+  );
 }
 
 - (NSURL *)resolveProjectRoot {
@@ -193,6 +221,9 @@
     NSString *urlText = [line substringFromIndex:prefix.length];
     NSURL *url = [NSURL URLWithString:urlText];
     if (url) {
+      self.serverScheme = url.scheme;
+      self.serverHost = url.host;
+      self.serverPort = url.port ? url.port.integerValue : 80;
       [self showStatus:@"Cochl.Sense Cloud Live Demo를 여는 중..."];
       [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
     }

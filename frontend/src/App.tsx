@@ -18,6 +18,7 @@ import { LiveSpectrogramPanel } from './LiveSpectrogramPanel';
 import {
   createLiveAudioCapture,
   encodePcm16Wav,
+  appendCompactedSpectrogramFrame,
   type LiveAudioWindow,
   type LiveSpectrogramFrame,
 } from './liveAudio';
@@ -53,7 +54,7 @@ import type {
 import { eventOverlayStyle, formatTime, peaksFromSamples } from './waveform';
 import './App.css';
 
-type RecorderStatus = 'idle' | 'recording' | 'ready' | 'uploading' | 'complete' | 'error';
+type RecorderStatus = 'idle' | 'starting' | 'recording' | 'ready' | 'uploading' | 'complete' | 'error';
 type SegmentPlaybackMode = 'loading' | 'buffer' | 'native';
 
 const LIVE_WINDOW_SEC = 2;
@@ -65,15 +66,18 @@ const LIVE_SPECTROGRAM_FPS = 12;
 const LIVE_SPECTROGRAM_BINS = 64;
 const LIVE_HISTORY_LIMIT = 6;
 const LIVE_COLLECTED_REFRESH_MS = 5000;
+const LIVE_REQUEST_TIMEOUT_MS = 60_000;
+const MAX_LIVE_SPECTROGRAM_FRAMES = 12_000;
 
 interface LiveCollectionCounts {
   collected: number;
   discardedSilent: number;
   discardedSpeech: number;
+  discardedLate: number;
 }
 
 function emptyLiveCollectionCounts(): LiveCollectionCounts {
-  return { collected: 0, discardedSilent: 0, discardedSpeech: 0 };
+  return { collected: 0, discardedSilent: 0, discardedSpeech: 0, discardedLate: 0 };
 }
 
 function applyCollectionStatus(
@@ -85,6 +89,9 @@ function applyCollectionStatus(
   }
   if (status === 'discarded_speech') {
     return { ...counts, discardedSpeech: counts.discardedSpeech + 1 };
+  }
+  if (status === 'discarded_late') {
+    return { ...counts, discardedLate: counts.discardedLate + 1 };
   }
   return { ...counts, discardedSilent: counts.discardedSilent + 1 };
 }
@@ -107,7 +114,8 @@ export default function App() {
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedMimeType, setSelectedMimeType] = useState('');
-  const [liveSpectrogramFrames, setLiveSpectrogramFrames] = useState<LiveSpectrogramFrame[]>([]);
+  const liveSpectrogramFramesRef = useRef<LiveSpectrogramFrame[]>([]);
+  const [liveSpectrogramVersion, setLiveSpectrogramVersion] = useState(0);
   const [liveTimelineEvents, setLiveTimelineEvents] = useState<LiveTimelineEvent[]>([]);
   const [liveDiagnostics, setLiveDiagnostics] = useState<LiveDiagnostics>(() => emptyLiveDiagnostics());
   const [liveViewportStartSec, setLiveViewportStartSec] = useState(0);
@@ -132,6 +140,8 @@ export default function App() {
   const liveInFlightRef = useRef(0);
   const liveSequenceRef = useRef(0);
   const liveSessionTokenRef = useRef('');
+  const livePendingRequestsRef = useRef<Map<string, Set<Promise<void>>>>(new Map());
+  const liveAbortControllersRef = useRef<Map<string, Set<AbortController>>>(new Map());
   const hasPendingLiveChunks = useMemo(
     () => hasPendingLiveChunkRecords(liveChunkRecords),
     [liveChunkRecords],
@@ -173,11 +183,11 @@ export default function App() {
 
   const durationLabel = useMemo(() => formatDuration(elapsedSec), [elapsedSec]);
   const liveDurationSec = useMemo(() => {
-    const frameTimes = liveSpectrogramFrames.map((frame) => frame.timestampSec);
+    const latestFrameTime = liveSpectrogramFramesRef.current.at(-1)?.timestampSec ?? 0;
     const eventTimes = liveTimelineEvents.map((event) => event.endTimeSec);
     const chunkTailEndSec = latestLiveChunkTailEndSec(liveChunkRecords, liveChunkSnapshotMs);
-    return Math.max(0, elapsedSec, chunkTailEndSec, ...frameTimes, ...eventTimes);
-  }, [elapsedSec, liveChunkRecords, liveChunkSnapshotMs, liveSpectrogramFrames, liveTimelineEvents]);
+    return Math.max(0, elapsedSec, chunkTailEndSec, latestFrameTime, ...eventTimes);
+  }, [elapsedSec, liveChunkRecords, liveChunkSnapshotMs, liveSpectrogramVersion, liveTimelineEvents]);
   const liveViewportState = useMemo(
     () => resolveLiveViewport(liveDurationSec, liveViewportStartSec, liveAutoFollow, LIVE_VIEWPORT_SEC),
     [liveAutoFollow, liveDurationSec, liveViewportStartSec],
@@ -193,6 +203,7 @@ export default function App() {
       return;
     }
 
+    setStatus('starting');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = selectSupportedMimeType();
@@ -203,9 +214,9 @@ export default function App() {
       chunksRef.current = [];
       streamRef.current = stream;
       recorderRef.current = recorder;
-      startedAtRef.current = Date.now();
       setElapsedSec(0);
-      startLiveCapture(stream, sessionId);
+      await startLiveCapture(stream, sessionId);
+      startedAtRef.current = Date.now();
       setSelectedMimeType(mimeType || recorder.mimeType || 'browser default');
       setRecordingFile(null);
 
@@ -238,6 +249,7 @@ export default function App() {
     } catch (err) {
       setStatus('error');
       setError(err instanceof Error ? err.message : '마이크 권한을 가져오지 못했습니다.');
+      stopLiveCapture({ clearTimeline: false, invalidateSession: true });
       stopTracks();
     }
   }
@@ -293,7 +305,7 @@ export default function App() {
     setStatus('idle');
   }
 
-  function startLiveCapture(stream: MediaStream, recordingSessionId: number) {
+  async function startLiveCapture(stream: MediaStream, recordingSessionId: number) {
     const liveSessionToken = `session-${Date.now()}-${recordingSessionId}`;
     liveSessionTokenRef.current = liveSessionToken;
     liveInFlightRef.current = 0;
@@ -302,7 +314,7 @@ export default function App() {
     setLiveLatencySample(null);
 
     try {
-      liveCleanupRef.current = createLiveAudioCapture(
+      const cleanup = await createLiveAudioCapture(
         stream,
         (window) => handleLiveWindow(window, liveSessionToken),
         {
@@ -313,6 +325,11 @@ export default function App() {
           spectrogramBins: LIVE_SPECTROGRAM_BINS,
         },
       );
+      if (liveSessionToken !== liveSessionTokenRef.current) {
+        cleanup();
+        return;
+      }
+      liveCleanupRef.current = cleanup;
     } catch (err) {
       liveCleanupRef.current = null;
       setLiveDiagnostics((current) => recordLiveDiagnostic(current, 'failure', 0, errorMessage(err)));
@@ -327,6 +344,8 @@ export default function App() {
     invalidateSession: boolean;
   }) {
     if (invalidateSession) {
+      const activeToken = liveSessionTokenRef.current;
+      abortLiveRequests(activeToken);
       liveSessionTokenRef.current = `inactive-${Date.now()}-${recordingSessionRef.current}`;
       liveInFlightRef.current = 0;
     }
@@ -340,7 +359,8 @@ export default function App() {
   }
 
   function clearLiveTimelineState() {
-    setLiveSpectrogramFrames([]);
+    liveSpectrogramFramesRef.current = [];
+    setLiveSpectrogramVersion((version) => version + 1);
     setLiveTimelineEvents([]);
     setLiveDiagnostics(emptyLiveDiagnostics());
     setLiveViewportStartSec(0);
@@ -351,15 +371,20 @@ export default function App() {
     setCollectionSummary(null);
   }
 
-  async function waitForLiveDrain(liveSessionToken: string, maxWaitMs = 8000) {
-    const startedAt = Date.now();
-    while (
-      liveSessionToken === liveSessionTokenRef.current &&
-      liveInFlightRef.current > 0 &&
-      Date.now() - startedAt < maxWaitMs
-    ) {
-      await new Promise((resolve) => window.setTimeout(resolve, 200));
+  async function waitForLiveDrain(liveSessionToken: string) {
+    while (true) {
+      const pending = [...(livePendingRequestsRef.current.get(liveSessionToken) ?? [])];
+      if (!pending.length) {
+        return;
+      }
+      await Promise.allSettled(pending);
     }
+  }
+
+  function abortLiveRequests(liveSessionToken: string) {
+    const controllers = liveAbortControllersRef.current.get(liveSessionToken);
+    controllers?.forEach((controller) => controller.abort());
+    liveAbortControllersRef.current.delete(liveSessionToken);
   }
 
   async function finalizeLiveSession(
@@ -383,6 +408,8 @@ export default function App() {
       );
       if (showSummary && liveSessionToken === liveSessionTokenRef.current) {
         setCollectionSummary(summary);
+        liveSessionTokenRef.current = `inactive-${Date.now()}-${recordingSessionRef.current}`;
+        liveInFlightRef.current = 0;
       }
       setCollectedRefreshToken((token) => token + 1);
     } catch (err) {
@@ -427,7 +454,16 @@ export default function App() {
     const pendingRecord = createPendingLiveChunkRecord(recordInput);
     upsertLiveChunkState(pendingRecord);
     liveInFlightRef.current += 1;
-    void submitLiveWindow(window, liveSessionToken, pendingRecord, Date.now());
+    const pendingRequest = submitLiveWindow(window, liveSessionToken, pendingRecord, Date.now());
+    const sessionRequests = livePendingRequestsRef.current.get(liveSessionToken) ?? new Set();
+    sessionRequests.add(pendingRequest);
+    livePendingRequestsRef.current.set(liveSessionToken, sessionRequests);
+    void pendingRequest.finally(() => {
+      sessionRequests.delete(pendingRequest);
+      if (!sessionRequests.size) {
+        livePendingRequestsRef.current.delete(liveSessionToken);
+      }
+    });
   }
 
   function handleLiveSpectrogramFrame(frame: LiveSpectrogramFrame, liveSessionToken: string) {
@@ -438,7 +474,12 @@ export default function App() {
   }
 
   function appendLiveSpectrogramFrame(frame: LiveSpectrogramFrame) {
-    setLiveSpectrogramFrames((current) => [...current, frame]);
+    liveSpectrogramFramesRef.current = appendCompactedSpectrogramFrame(
+      liveSpectrogramFramesRef.current,
+      frame,
+      MAX_LIVE_SPECTROGRAM_FRAMES,
+    );
+    setLiveSpectrogramVersion((version) => version + 1);
   }
 
   async function submitLiveWindow(
@@ -448,6 +489,11 @@ export default function App() {
     windowEmittedAtMs: number,
   ) {
     let currentRecord = initialRecord;
+    const controller = new AbortController();
+    const sessionControllers = liveAbortControllersRef.current.get(liveSessionToken) ?? new Set();
+    sessionControllers.add(controller);
+    liveAbortControllersRef.current.set(liveSessionToken, sessionControllers);
+    const timeout = globalThis.setTimeout(() => controller.abort(), LIVE_REQUEST_TIMEOUT_MS);
     try {
       const file = encodePcm16Wav(window.samples, window.sampleRate);
       if (liveSessionToken !== liveSessionTokenRef.current) {
@@ -463,6 +509,7 @@ export default function App() {
         windowStartSec: window.windowStartSec,
         windowEndSec: window.windowEndSec,
         sessionName: sessionNameRef.current.trim() || undefined,
+        signal: controller.signal,
       });
       const responseReceivedAtMs = Date.now();
       if (liveSessionToken !== liveSessionTokenRef.current) {
@@ -510,6 +557,11 @@ export default function App() {
         ));
       }
     } finally {
+      globalThis.clearTimeout(timeout);
+      sessionControllers.delete(controller);
+      if (!sessionControllers.size) {
+        liveAbortControllersRef.current.delete(liveSessionToken);
+      }
       if (liveSessionToken === liveSessionTokenRef.current) {
         liveInFlightRef.current = Math.max(0, liveInFlightRef.current - 1);
       }
@@ -610,16 +662,19 @@ export default function App() {
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
   }
 
-  const canStart = status === 'idle' || status === 'error' || status === 'complete';
+  const canStart =
+    !collectionFinalizing && (status === 'idle' || status === 'error' || status === 'complete');
   const canComplete = status === 'recording';
-  const canSubmit = status === 'ready';
-  const canDiscard = status !== 'uploading' && status !== 'idle';
+  const canSubmit = status === 'ready' && !collectionFinalizing;
+  const canDiscard =
+    !collectionFinalizing && status !== 'uploading' && status !== 'starting' && status !== 'idle';
   const canDownloadCsv =
     (status === 'ready' || status === 'uploading' || status === 'complete') && liveChunkRecords.length > 0;
   const hasCollectionActivity =
     liveCollectionCounts.collected > 0 ||
     liveCollectionCounts.discardedSilent > 0 ||
-    liveCollectionCounts.discardedSpeech > 0;
+    liveCollectionCounts.discardedSpeech > 0 ||
+    liveCollectionCounts.discardedLate > 0;
 
   return (
     <main className="app-shell">
@@ -645,7 +700,7 @@ export default function App() {
                 title="의미 있는 소리 구간만 저장합니다. 무음과 음성(프라이버시) 구간은 제외됩니다."
               >
                 수집 {liveCollectionCounts.collected} · 무음 제외 {liveCollectionCounts.discardedSilent} · 음성 제외{' '}
-                {liveCollectionCounts.discardedSpeech}
+                {liveCollectionCounts.discardedSpeech} · 종료 후 제외 {liveCollectionCounts.discardedLate}
               </span>
             )}
             {liveLatencySample && (
@@ -658,7 +713,8 @@ export default function App() {
             )}
           </div>
           <LiveSpectrogramPanel
-            frames={liveSpectrogramFrames}
+            frames={liveSpectrogramFramesRef.current}
+            frameVersion={liveSpectrogramVersion}
             events={liveTimelineEvents}
             diagnostics={liveDiagnostics}
             viewport={liveViewportState.viewport}
@@ -683,6 +739,7 @@ export default function App() {
               maxLength={100}
               placeholder="예: 사무실 오후 소음 (선택)"
               onChange={handleSessionNameChange}
+              disabled={status === 'starting' || status === 'recording'}
             />
           </div>
           <div className="controls" aria-label="녹음 컨트롤">
@@ -831,6 +888,7 @@ function formatIsoTimestamp(value: string): string {
 function StatusBadge({ status }: { status: RecorderStatus }) {
   const labels: Record<RecorderStatus, string> = {
     idle: '대기',
+    starting: '마이크 준비 중',
     recording: '녹음 중',
     ready: '업로드 준비',
     uploading: '분석 중',
@@ -1183,6 +1241,7 @@ export function AnalysisPanel({ analysis, recordingFile }: AnalysisPanelProps) {
   function handleNativeAudioPlay() {
     stopBufferedSegment();
     stopRecordingPlayback({ resetPosition: false });
+    segmentEndRef.current = null;
     setPlaybackError(null);
   }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from math import isfinite
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -91,6 +92,7 @@ class Settings:
             ),
         )
         settings.validate_service_combination()
+        settings.validate_upload()
         settings.validate_collection()
         return settings
 
@@ -104,7 +106,19 @@ class Settings:
                 "Audio Insights requires both Sound Event Detection and Speech Analysis."
             )
 
+    def validate_upload(self) -> None:
+        if self.max_upload_mb <= 0:
+            raise ValueError("Upload size limit must be positive.")
+
     def validate_collection(self) -> None:
+        numeric_values = (
+            self.collection_confidence_threshold,
+            self.collection_min_segment_sec,
+            self.collection_max_segment_sec,
+            self.collection_silence_close_sec,
+        )
+        if not all(isfinite(value) for value in numeric_values):
+            raise ValueError("Collection numeric settings must be finite.")
         if not 0.0 <= self.collection_confidence_threshold <= 1.0:
             raise ValueError("Collection confidence threshold must be between 0 and 1.")
         if self.collection_max_segment_sec <= 0:

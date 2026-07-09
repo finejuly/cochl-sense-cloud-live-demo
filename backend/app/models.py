@@ -1,6 +1,15 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+LiveChunkCollectionStatus = Literal[
+    "collected",
+    "discarded_silent",
+    "discarded_speech",
+    "discarded_late",
+]
 
 
 class RecordingMetadata(BaseModel):
@@ -52,7 +61,7 @@ class LiveChunkAnalysisResponse(BaseModel):
     window_end_sec: float
     sound_events: list[SoundEvent] = Field(default_factory=list)
     processing_time_ms: int
-    collection_status: str | None = None
+    collection_status: LiveChunkCollectionStatus | None = None
 
 
 class CollectedSegmentSummary(BaseModel):

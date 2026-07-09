@@ -72,6 +72,13 @@ def test_collection_validation_rejects_out_of_range_values():
             collection_confidence_threshold=1.5,
         ).validate_collection()
     with pytest.raises(ValueError):
+        Settings(cochl_project_key="key", max_upload_mb=0).validate_upload()
+    with pytest.raises(ValueError):
+        Settings(
+            cochl_project_key="key",
+            collection_max_segment_sec=float("nan"),
+        ).validate_collection()
+    with pytest.raises(ValueError):
         Settings(
             cochl_project_key="key",
             collection_max_segment_sec=0,

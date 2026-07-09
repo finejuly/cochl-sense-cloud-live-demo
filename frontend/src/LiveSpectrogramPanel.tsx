@@ -17,6 +17,7 @@ import { formatTime } from './waveform';
 
 interface LiveSpectrogramPanelProps {
   frames: LiveSpectrogramFrame[];
+  frameVersion: number;
   events: LiveTimelineEvent[];
   diagnostics: LiveDiagnostics;
   viewport: LiveTimelineViewport;
@@ -38,6 +39,7 @@ const CHUNK_LANE_HEIGHT = 24;
 
 export function LiveSpectrogramPanel({
   frames,
+  frameVersion,
   events,
   diagnostics,
   viewport,
@@ -85,7 +87,7 @@ export function LiveSpectrogramPanel({
     }
 
     drawSpectrogram(canvas, frames, viewport);
-  }, [frames, viewport]);
+  }, [frameVersion, frames, viewport]);
 
   function handleSliderChange(event: ChangeEvent<HTMLInputElement>) {
     onViewportStartChange(Number(event.currentTarget.value));
@@ -268,9 +270,7 @@ function drawSpectrogram(
   context.fillStyle = '#101a22';
   context.fillRect(0, 0, width, height);
 
-  frames
-    .filter((frame) => frame.timestampSec >= viewport.startSec && frame.timestampSec <= viewport.endSec)
-    .forEach((frame) => {
+  framesInViewport(frames, viewport).forEach((frame) => {
       const x = ((frame.timestampSec - viewport.startSec) / viewportDurationSec) * width;
       const binHeight = height / Math.max(1, frame.magnitudes.length);
       const columnWidth = Math.max(1, width / Math.max(1, viewportDurationSec * 12));
@@ -284,7 +284,35 @@ function drawSpectrogram(
           Math.max(1, binHeight),
         );
       });
-    });
+  });
+}
+
+export function framesInViewport(
+  frames: LiveSpectrogramFrame[],
+  viewport: LiveTimelineViewport,
+): LiveSpectrogramFrame[] {
+  let low = 0;
+  let high = frames.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (frames[middle].timestampSec < viewport.startSec) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  const startIndex = low;
+
+  high = frames.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (frames[middle].timestampSec <= viewport.endSec) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return frames.slice(startIndex, low);
 }
 
 function colorForMagnitude(value: number): string {

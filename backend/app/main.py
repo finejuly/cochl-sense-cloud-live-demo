@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from itertools import count
+from math import isfinite
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
+from typing import BinaryIO
 
 from anyio import CapacityLimiter
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -18,6 +21,8 @@ from starlette.concurrency import run_in_threadpool
 
 from backend.app.audio import (
     AudioConversionError,
+    DuplicateUploadError,
+    EmptyUploadError,
     UploadTooLargeError,
     convert_to_mp3,
     extension_for_content_type,
@@ -48,8 +53,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 DEFAULT_RECORDINGS_DIR = PROJECT_ROOT / "recordings"
 LIVE_PROVIDER_MAX_CONCURRENCY = 10
+RECORDING_PROVIDER_MAX_CONCURRENCY = 2
 LIVE_CONVERSION_MAX_WORKERS = 2
 LIVE_CONVERSION_MAX_PENDING = 32
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+LIVE_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 logger = logging.getLogger(__name__)
 
 
@@ -98,6 +106,9 @@ def create_app(frontend_dist: Path | None = DEFAULT_FRONTEND_DIST) -> FastAPI:
     )
     created_app.state.provider_factory = None
     created_app.state.live_provider_limiter = CapacityLimiter(LIVE_PROVIDER_MAX_CONCURRENCY)
+    created_app.state.recording_provider_limiter = CapacityLimiter(
+        RECORDING_PROVIDER_MAX_CONCURRENCY
+    )
     created_app.state.live_conversion_executor = ThreadPoolExecutor(
         max_workers=LIVE_CONVERSION_MAX_WORKERS,
         thread_name_prefix="cochl-sense-cloud-live-convert",
@@ -207,14 +218,13 @@ async def analyze_recording(
     started_at = perf_counter()
     try:
         source_path = await _save_upload(file, settings.max_upload_mb)
-        prepared = prepare_audio_for_cochl(
+        provider = _provider(request.app, settings)
+        prepared, raw_result = await _prepare_and_analyze_recording(
+            request.app,
+            provider,
             source_path,
             file.content_type,
-            source_path.name,
         )
-
-        provider = _provider(request.app, settings)
-        raw_result = provider.analyze_file(prepared.path)
         processing_time_ms = int((perf_counter() - started_at) * 1000)
         return normalize_cochl_result(
             raw_result,
@@ -223,8 +233,12 @@ async def analyze_recording(
             services_used=settings.enabled_services(),
             processing_time_ms=processing_time_ms,
         )
+    except EmptyUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except UploadTooLargeError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except DuplicateUploadError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except AudioConversionError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
     except ValueError as exc:
@@ -253,7 +267,10 @@ async def analyze_live_chunk(
         )
 
     started_at = perf_counter()
+    saved_path: Path | None = None
+    live_file_handled = False
     try:
+        _validate_live_chunk_metadata(sequence_id, window_start_sec, window_end_sec)
         saved_path = await _save_live_chunk_upload(
             file,
             settings.max_upload_mb,
@@ -283,10 +300,13 @@ async def analyze_live_chunk(
                     events=sound_events,
                     session_name=_clean_session_name(session_name),
                 )
+                live_file_handled = True
             except Exception:
                 logger.exception(
                     "Collection failed for live chunk sequence %s.", sequence_id
                 )
+                await run_in_threadpool(_discard_live_chunk_file, saved_path)
+                live_file_handled = True
         else:
             schedule_live_chunk_conversion(request.app, saved_path)
         return LiveChunkAnalysisResponse(
@@ -297,8 +317,14 @@ async def analyze_live_chunk(
             processing_time_ms=processing_time_ms,
             collection_status=collection_status,
         )
+    except EmptyUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except UploadTooLargeError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except DuplicateUploadError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
@@ -307,6 +333,9 @@ async def analyze_live_chunk(
             status_code=502,
             detail="Cochl live chunk analysis failed.",
         ) from exc
+    finally:
+        if settings.collection_enabled and saved_path is not None and not live_file_handled:
+            await run_in_threadpool(_discard_live_chunk_file, saved_path)
 
 
 async def end_live_session(
@@ -433,17 +462,22 @@ async def _save_upload(
     max_upload_mb: int,
     recordings_dir: Path | None = None,
 ) -> Path:
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Recording file is empty.")
-    validate_upload_size(len(data), max_upload_mb)
-
     suffix = _upload_suffix(file.content_type, file.filename)
     target_dir = recordings_dir or DEFAULT_RECORDINGS_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = _available_recording_path(target_dir, file.filename, suffix)
-    target_path.write_bytes(data)
-    return target_path
+    while True:
+        target_path = _available_recording_path(target_dir, file.filename, suffix)
+        try:
+            await run_in_threadpool(
+                _write_upload_stream,
+                file.file,
+                target_path,
+                max_upload_mb,
+                "Recording file is empty.",
+            )
+        except FileExistsError:
+            continue
+        return target_path
 
 
 async def _save_live_chunk_upload(
@@ -455,26 +489,83 @@ async def _save_live_chunk_upload(
     window_end_sec: float,
     recordings_dir: Path | None = None,
 ) -> Path:
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Live chunk file is empty.")
-    validate_upload_size(len(data), max_upload_mb)
-
     safe_session_id = _safe_live_session_id(session_id)
     live_dir = (recordings_dir or DEFAULT_RECORDINGS_DIR) / "live" / safe_session_id
     live_dir.mkdir(parents=True, exist_ok=True)
     filename = f"chunk-{sequence_id:06d}-{window_start_sec:.3f}-{window_end_sec:.3f}.wav"
     target_path = live_dir / filename
-    target_path.write_bytes(data)
+    try:
+        await run_in_threadpool(
+            _write_upload_stream,
+            file.file,
+            target_path,
+            max_upload_mb,
+            "Live chunk file is empty.",
+        )
+    except FileExistsError as exc:
+        raise DuplicateUploadError(
+            f"Live chunk {sequence_id} already exists for this session."
+        ) from exc
     return target_path
 
 
 def _safe_live_session_id(session_id: str) -> str:
-    safe = "".join(
-        char if char.isascii() and (char.isalnum() or char in {"_", "-", "."}) else "_"
-        for char in session_id
-    ).lstrip(".")
-    return safe or "session"
+    if not LIVE_SESSION_ID_PATTERN.fullmatch(session_id) or session_id in {".", ".."}:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Session id must start with an ASCII letter or number and use "
+                "only letters, numbers, dots, underscores, or hyphens (128 max)."
+            ),
+        )
+    return session_id
+
+
+def _validate_live_chunk_metadata(
+    sequence_id: int,
+    window_start_sec: float,
+    window_end_sec: float,
+) -> None:
+    if sequence_id < 1:
+        raise HTTPException(status_code=422, detail="Sequence id must be positive.")
+    if not isfinite(window_start_sec) or not isfinite(window_end_sec):
+        raise HTTPException(status_code=422, detail="Live window times must be finite.")
+    if window_start_sec < 0 or window_end_sec <= window_start_sec:
+        raise HTTPException(
+            status_code=422,
+            detail="Live window end must be greater than its non-negative start.",
+        )
+
+
+def _write_upload_stream(
+    source: BinaryIO,
+    target_path: Path,
+    max_upload_mb: int,
+    empty_message: str,
+) -> None:
+    total_bytes = 0
+    try:
+        with target_path.open("xb") as target:
+            while chunk := source.read(UPLOAD_READ_CHUNK_BYTES):
+                total_bytes += len(chunk)
+                validate_upload_size(total_bytes, max_upload_mb)
+                target.write(chunk)
+        if total_bytes == 0:
+            raise EmptyUploadError(empty_message)
+    except FileExistsError:
+        raise
+    except Exception:
+        target_path.unlink(missing_ok=True)
+        raise
+
+
+def _discard_live_chunk_file(wav_path: Path) -> None:
+    try:
+        wav_path.unlink(missing_ok=True)
+        wav_path.parent.rmdir()
+    except OSError:
+        # The directory may still contain other in-flight chunks.
+        pass
 
 
 def convert_live_chunk_to_mp3(wav_path: Path) -> None:
@@ -572,6 +663,27 @@ async def _analyze_live_chunk_with_provider(
         return await run_in_threadpool(provider.analyze_live_chunk, saved_path)
     async with limiter:
         return await run_in_threadpool(provider.analyze_live_chunk, saved_path)
+
+
+async def _prepare_and_analyze_recording(
+    current_app: FastAPI,
+    provider: CochlProvider,
+    source_path: Path,
+    content_type: str | None,
+):
+    def prepare_and_analyze():
+        prepared = prepare_audio_for_cochl(
+            source_path,
+            content_type,
+            source_path.name,
+        )
+        return prepared, provider.analyze_file(prepared.path)
+
+    limiter = getattr(current_app.state, "recording_provider_limiter", None)
+    if limiter is None:
+        return await run_in_threadpool(prepare_and_analyze)
+    async with limiter:
+        return await run_in_threadpool(prepare_and_analyze)
 
 
 app = create_app()

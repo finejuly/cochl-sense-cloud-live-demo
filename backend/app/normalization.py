@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import isfinite
 from typing import Any
 
 from backend.app.models import (
@@ -133,9 +134,10 @@ def _as_list(value: Any) -> list[Any]:
 
 def _float(value: Any) -> float:
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return 0.0
+    return parsed if isfinite(parsed) else 0.0
 
 
 def _optional_float(value: Any) -> float | None:
@@ -153,7 +155,21 @@ def _optional_str(value: Any) -> str | None:
 def _optional_bool(value: Any) -> bool | None:
     if value is None:
         return None
-    return bool(value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
 
 
 def _first_present(*values: Any) -> Any:
