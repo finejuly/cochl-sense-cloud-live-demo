@@ -220,6 +220,65 @@ def test_collector_splits_segments_on_time_gap(tmp_path):
     assert not silent_path.exists()
 
 
+def test_collector_merges_nearby_bursts_through_buffered_silence(tmp_path):
+    chunks_dir = tmp_path / "live"
+    output_dir = tmp_path / "collected"
+    policy = CollectionPolicy(
+        confidence_threshold=0.5,
+        exclude_label_keywords=("speech",),
+        min_segment_sec=5.0,
+        max_segment_sec=20.0,
+        silence_close_sec=5.0,
+        reorder_hold_back_sec=100.0,
+    )
+    collector = SegmentCollector("session-a", output_dir, policy)
+
+    for sequence_id, (start, end) in enumerate(
+        [(0, 2), (1, 3), (2, 4)], start=1
+    ):
+        add_chunk(collector, chunks_dir, sequence_id, start, end, [event()])
+    add_chunk(collector, chunks_dir, 4, 3, 5, [])
+    add_chunk(collector, chunks_dir, 5, 4, 6, [])
+    add_chunk(collector, chunks_dir, 6, 5, 7, [])
+    add_chunk(collector, chunks_dir, 7, 6, 8, [event("Knock")])
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 1
+    assert summary.segments[0].start_sec == 0.0
+    assert summary.segments[0].end_sec == 8.0
+    assert read_wav_values(output_dir / summary.segments[0].audio_filename) == list(
+        range(8 * FRAMERATE)
+    )
+
+
+def test_collector_keeps_bursts_separate_after_silence_timeout(tmp_path):
+    chunks_dir = tmp_path / "live"
+    policy = CollectionPolicy(
+        confidence_threshold=0.5,
+        exclude_label_keywords=("speech",),
+        min_segment_sec=5.0,
+        max_segment_sec=20.0,
+        silence_close_sec=5.0,
+        reorder_hold_back_sec=100.0,
+    )
+    collector = SegmentCollector("session-a", tmp_path / "collected", policy)
+
+    add_chunk(collector, chunks_dir, 1, 0, 2, [event("Keyboard")])
+    for sequence_id, (start, end) in enumerate(
+        [(1, 3), (2, 4), (3, 5), (4, 6), (5, 7), (6, 8), (7, 9)],
+        start=2,
+    ):
+        add_chunk(collector, chunks_dir, sequence_id, start, end, [])
+    add_chunk(collector, chunks_dir, 9, 8, 10, [event("Knock")])
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 2
+    assert summary.segments[0].labels == ["Keyboard"]
+    assert summary.segments[1].labels == ["Knock"]
+
+
 def test_collector_splits_segments_at_speech_even_when_contiguous(tmp_path):
     chunks_dir = tmp_path / "live"
     collector = SegmentCollector("session-a", tmp_path / "collected", POLICY)

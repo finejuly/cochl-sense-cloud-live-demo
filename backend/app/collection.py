@@ -38,7 +38,7 @@ class CollectionPolicy:
     exclude_label_keywords: tuple[str, ...] = ()
     min_segment_sec: float = 5.0
     max_segment_sec: float = 20.0
-    silence_close_sec: float = 3.0
+    silence_close_sec: float = 5.0
     reorder_hold_back_sec: float = DEFAULT_REORDER_HOLD_BACK_SEC
 
 
@@ -203,13 +203,16 @@ class SegmentCollector:
         if self._segment_chunks:
             current_end = max(chunk.window_end_sec for chunk in self._segment_chunks)
             segment_start = min(chunk.window_start_sec for chunk in self._segment_chunks)
-            if entry.window_start_sec > current_end + _TIME_EPSILON_SEC:
-                self._finalize_current_segment("gap")
-            elif (
+            if (
                 entry.window_end_sec - segment_start
                 > self.policy.max_segment_sec + _TIME_EPSILON_SEC
             ):
                 self._finalize_current_segment("max_duration")
+            elif (
+                entry.window_start_sec > current_end + _TIME_EPSILON_SEC
+                and not self._bridge_context_to(entry)
+            ):
+                self._finalize_current_segment("gap")
         if self._segment_chunks:
             self._segment_chunks.append(entry)
         else:
@@ -263,13 +266,41 @@ class SegmentCollector:
             # segment start — discard it.
             self._flush_context_buffer()
         self._context_buffer.append(entry)
+        context_retention_sec = max(
+            self.policy.min_segment_sec,
+            self.policy.silence_close_sec,
+        )
         while self._context_buffer and (
             self._context_buffer[0].window_end_sec
-            < entry.window_end_sec - self.policy.min_segment_sec - _TIME_EPSILON_SEC
+            < entry.window_end_sec - context_retention_sec - _TIME_EPSILON_SEC
         ):
             dropped = self._context_buffer.pop(0)
             self._discarded_silent_count += 1
             self._delete_chunk_file(dropped)
+
+    def _bridge_context_to(self, entry: _ChunkEntry) -> bool:
+        """Move buffered silence into an open segment when it reaches `entry`.
+
+        Once a segment reaches its minimum length, later silent chunks wait in
+        the context buffer instead of extending the file. A nearby detection
+        should consume that buffer and remain in the same segment; only a real
+        hole in the captured audio should force a gap split.
+        """
+        if not self._segment_chunks or not self._context_buffer:
+            return False
+
+        bridged_end = max(chunk.window_end_sec for chunk in self._segment_chunks)
+        for candidate in self._context_buffer:
+            if candidate.window_start_sec > bridged_end + _TIME_EPSILON_SEC:
+                return False
+            bridged_end = max(bridged_end, candidate.window_end_sec)
+
+        if entry.window_start_sec > bridged_end + _TIME_EPSILON_SEC:
+            return False
+
+        self._segment_chunks.extend(self._context_buffer)
+        self._context_buffer = []
+        return True
 
     def _start_segment_with_context(self, entry: _ChunkEntry) -> None:
         # Split the min-length deficit across both sides: only half becomes
