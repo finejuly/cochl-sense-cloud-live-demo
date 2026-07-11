@@ -1,6 +1,7 @@
 import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  AudioLines,
   CheckCircle2,
   Database,
   Maximize2,
@@ -88,6 +89,7 @@ const LIVE_HISTORY_LIMIT = 6;
 const LIVE_REQUEST_TIMEOUT_MS = 60_000;
 const MAX_LIVE_SPECTROGRAM_FRAMES = 12_000;
 const LIVE_UI_HISTORY_RETENTION_SEC = 60 * 60;
+const COMPACT_SOUND_RECENCY_MS = 5_000;
 const COLLECTION_SUMMARY_DISPLAY_LIMIT = 100;
 
 interface LiveCollectionCounts {
@@ -121,6 +123,7 @@ interface LiveLatencySample {
   label: string;
   sequenceId: number;
   confidence: number | null;
+  observedAtMs: number;
   eventDelayMs: number;
   requestMs: number;
   backendMs: number;
@@ -212,6 +215,11 @@ export default function App() {
   useEffect(() => () => requestNativeWindowMode(false), []);
 
   const durationLabel = useMemo(() => formatDuration(elapsedSec), [elapsedSec]);
+  const compactDetectedSound =
+    liveLatencySample &&
+    liveChunkSnapshotMs - liveLatencySample.observedAtMs <= COMPACT_SOUND_RECENCY_MS
+      ? liveLatencySample
+      : null;
   const liveDurationSec = useMemo(() => {
     const latestFrameTime = liveSpectrogramFramesRef.current.at(-1)?.timestampSec ?? 0;
     const eventTimes = liveTimelineEvents.map((event) => event.endTimeSec);
@@ -571,6 +579,7 @@ export default function App() {
       label: event.label,
       sequenceId: response.sequence_id,
       confidence: event.confidence,
+      observedAtMs: markerCreatedAtMs,
       eventDelayMs: positiveRoundedMs(markerCreatedAtMs - (recordingStartedAtMs + event.start_time_sec * 1000)),
       requestMs: positiveRoundedMs(responseReceivedAtMs - requestStartedAtMs),
       backendMs: positiveRoundedMs(response.processing_time_ms),
@@ -661,55 +670,58 @@ export default function App() {
         aria-labelledby={compactMode ? 'compact-recorder-title' : 'app-title'}
       >
         {compactMode && (
-          <section className="compact-recorder" aria-label="컴팩트 녹음 상태">
+          <section className="compact-recorder" aria-label="작게 보기 녹음 상태">
             <header className="compact-recorder-header">
-              <div>
-                <p className="eyebrow">Cochl.Sense Cloud</p>
-                <h1 id="compact-recorder-title">
-                  {sessionName.trim() || '장시간 녹음'}
-                </h1>
-              </div>
+              <h1 id="compact-recorder-title" className="compact-recording-indicator">
+                <span aria-hidden="true" />
+                녹음 중
+              </h1>
               <button
                 type="button"
                 className="compact-expand-button"
                 onClick={() => setCompactMode(false)}
                 aria-label="전체 화면으로 보기"
+                title="전체 화면으로 보기"
               >
                 <Maximize2 size={16} aria-hidden="true" />
-                전체 보기
               </button>
             </header>
-            <div className="compact-recorder-timer" aria-live="polite">
-              {durationLabel}
+
+            <div className="compact-recorder-time">
+              <span>녹음 시간</span>
+              <time dateTime={`PT${elapsedSec}S`} aria-label={`녹음 시간 ${durationLabel}`}>
+                {durationLabel}
+              </time>
             </div>
-            <div className="compact-recorder-status" role="status" aria-live="polite">
-              <span className="compact-recording-indicator">
-                <span aria-hidden="true" />
-                녹음 중
+
+            <div
+              className={`compact-sound-status${compactDetectedSound ? ' is-detected' : ''}`}
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              <span className="compact-sound-icon" aria-hidden="true">
+                <AudioLines size={21} strokeWidth={2.2} />
               </span>
-              <span>
-                {collectionFinalizing
-                  ? '마지막 데이터를 정리 중'
-                  : liveDiagnostics.failureCount > 0
-                    ? `실시간 분석 오류 ${liveDiagnostics.failureCount}건`
-                    : hasPendingLiveChunks
-                      ? '실시간 분석 처리 중'
-                      : '실시간 분석 동작 중'}
+              <span className="compact-sound-copy">
+                <span>지금 들리는 소리</span>
+                <strong>{compactDetectedSound?.label ?? '귀 기울이는 중…'}</strong>
               </span>
+              {typeof compactDetectedSound?.confidence === 'number' && (
+                <span className="compact-sound-confidence">
+                  {Math.round(compactDetectedSound.confidence * 100)}%
+                </span>
+              )}
             </div>
-            <p className="compact-collection-status">
-              수집 {liveCollectionCounts.collected} · 무음 제외{' '}
-              {liveCollectionCounts.discardedSilent} · 음성 제외{' '}
-              {liveCollectionCounts.discardedSpeech}
-            </p>
+
             <button
-              className="primary compact-complete-button"
+              className="compact-stop-button"
               type="button"
               onClick={completeRecording}
               disabled={!canComplete}
             >
-              <Square size={16} aria-hidden="true" />
-              녹음 완료
+              <Square size={15} fill="currentColor" aria-hidden="true" />
+              녹음 중지
             </button>
           </section>
         )}
