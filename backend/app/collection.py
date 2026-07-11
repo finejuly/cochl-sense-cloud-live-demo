@@ -28,6 +28,7 @@ from backend.app.models import (
     CollectedSegmentSummary,
     CollectedSessionInfo,
     GcsUploadStatus,
+    LiveCurationProgress,
     LiveSessionEndResponse,
     SoundEvent,
 )
@@ -76,7 +77,7 @@ class CollectionPolicy:
     exclude_label_keywords: tuple[str, ...] = ()
     min_segment_sec: float = 5.0
     max_segment_sec: float = 20.0
-    silence_close_sec: float = 5.0
+    silence_close_sec: float = 3.0
     reorder_hold_back_sec: float = DEFAULT_REORDER_HOLD_BACK_SEC
     curation: CurationPolicy = field(default_factory=CurationPolicy)
 
@@ -288,6 +289,21 @@ class SegmentCollector:
             **curation.__dict__,
         )
 
+    def curation_progress(self) -> LiveCurationProgress:
+        with self._lock:
+            curation = self._curator.summary()
+            return LiveCurationProgress(
+                candidate_segment_count=curation.candidate_segment_count,
+                selected_segment_count=len(self._segments),
+                rejected_repetitive_count=curation.rejected_repetitive_count,
+                rejected_class_balance_count=curation.rejected_class_balance_count,
+                rejected_session_budget_count=(
+                    curation.rejected_session_budget_count
+                ),
+                invalid_audio_count=curation.invalid_audio_count,
+                write_error_count=curation.write_error_count,
+            )
+
     def _process_entry(self, entry: _ChunkEntry) -> None:
         entry_order = (entry.window_start_sec, entry.sequence_id)
         if (
@@ -361,6 +377,27 @@ class SegmentCollector:
                 <= self.policy.max_segment_sec + _TIME_EPSILON_SEC
             ):
                 self._segment_chunks.append(entry)
+                last_kept_end = max(
+                    chunk.window_end_sec
+                    for chunk in self._segment_chunks
+                    if chunk.decision == CHUNK_COLLECTED
+                )
+                padded_end = max(
+                    chunk.window_end_sec for chunk in self._segment_chunks
+                )
+                padded_start = min(
+                    chunk.window_start_sec for chunk in self._segment_chunks
+                )
+                if (
+                    padded_end - padded_start
+                    >= self.policy.min_segment_sec - _TIME_EPSILON_SEC
+                    and entry.window_end_sec - last_kept_end
+                    >= self.policy.silence_close_sec - _TIME_EPSILON_SEC
+                ):
+                    # The same chunk can satisfy both minimum padding and the
+                    # close threshold. Decide now instead of waiting for one
+                    # redundant future window.
+                    self._finalize_current_segment("silence")
                 return
             last_kept_end = max(
                 chunk.window_end_sec
@@ -1022,6 +1059,31 @@ class LiveCollectionManager:
             window_end_sec=window_end_sec,
             wav_path=wav_path,
             events=events,
+        )
+
+    def get_curation_progress(
+        self,
+        session_id: str,
+    ) -> LiveCurationProgress | None:
+        with self._lock:
+            collector = self._collectors.get(session_id)
+            ended_summary = self._ended_summaries.get(session_id)
+        if collector is not None:
+            return collector.curation_progress()
+        if ended_summary is None:
+            return None
+        return LiveCurationProgress(
+            candidate_segment_count=ended_summary.candidate_segment_count,
+            selected_segment_count=ended_summary.segment_count,
+            rejected_repetitive_count=ended_summary.rejected_repetitive_count,
+            rejected_class_balance_count=(
+                ended_summary.rejected_class_balance_count
+            ),
+            rejected_session_budget_count=(
+                ended_summary.rejected_session_budget_count
+            ),
+            invalid_audio_count=ended_summary.invalid_audio_count,
+            write_error_count=ended_summary.write_error_count,
         )
 
     def end_session(

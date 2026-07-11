@@ -2,6 +2,7 @@ import json
 import struct
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
@@ -736,6 +737,61 @@ def test_sustained_silence_finalizes_the_segment_in_real_time(tmp_path):
     assert summary.segments[0].end_sec == 5.0
     final_summary = json.loads((output_dir / "session.json").read_text("utf-8"))
     assert final_summary["ended_at"] is not None
+
+
+def test_default_policy_decides_silent_candidate_two_seconds_before_legacy_policy(
+    tmp_path,
+):
+    default_policy = policy_from_settings(Settings(cochl_project_key="key"))
+    legacy_policy = replace(default_policy, silence_close_sec=5.0)
+    default_output = tmp_path / "default-collected"
+    legacy_output = tmp_path / "legacy-collected"
+    default_collector = SegmentCollector(
+        "default-session",
+        default_output,
+        default_policy,
+    )
+    legacy_collector = SegmentCollector(
+        "legacy-session",
+        legacy_output,
+        legacy_policy,
+    )
+
+    for collector, live_dir in (
+        (default_collector, tmp_path / "default-live"),
+        (legacy_collector, tmp_path / "legacy-live"),
+    ):
+        add_chunk(collector, live_dir, 1, 0, 2, [event("Glass_break", 0.9)])
+        for sequence_id, start_sec in enumerate(range(1, 8), start=2):
+            add_chunk(
+                collector,
+                live_dir,
+                sequence_id,
+                start_sec,
+                start_sec + 2,
+                [],
+            )
+
+    # With the six-second reorder guard intact, the newest received window is
+    # 7-9 s when the default policy can safely decide the 0-5 s candidate.
+    assert len(list(default_output.glob("segment-*.wav"))) == 1
+    assert not list(legacy_output.glob("segment-*.wav"))
+
+    for sequence_id, start_sec in ((9, 8), (10, 9)):
+        add_chunk(
+            legacy_collector,
+            tmp_path / "legacy-live",
+            sequence_id,
+            start_sec,
+            start_sec + 2,
+            [],
+        )
+
+    # The previous five-second close policy waits through the 9-11 s window.
+    assert len(list(legacy_output.glob("segment-*.wav"))) == 1
+
+    default_collector.end_session()
+    legacy_collector.end_session()
 
 
 def test_brief_lull_does_not_split_an_ongoing_detection(tmp_path):
