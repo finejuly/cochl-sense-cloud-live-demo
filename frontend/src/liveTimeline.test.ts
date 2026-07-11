@@ -6,6 +6,7 @@ import {
   mergeLiveTimelineEvents,
   recordLiveDiagnostic,
   renderLiveTimelineEvents,
+  retainRecentLiveTimelineEvents,
   resolveLiveViewport,
   type LiveTimelineEvent,
 } from './liveTimeline';
@@ -136,6 +137,20 @@ describe('mergeLiveTimelineEvents', () => {
     );
 
     expect(merged.map((item) => item.label)).toEqual(['Keyboard', 'Alarm', 'Speech']);
+  });
+});
+
+describe('retainRecentLiveTimelineEvents', () => {
+  it('keeps the full retention boundary and drops only older display events', () => {
+    const events = [
+      event('Old', 50, 100),
+      event('Boundary', 350, 400),
+      event('Recent', 3990, 4000),
+    ];
+
+    const retained = retainRecentLiveTimelineEvents(events, 4000, 3600);
+
+    expect(retained.map((item) => item.label)).toEqual(['Boundary', 'Recent']);
   });
 });
 

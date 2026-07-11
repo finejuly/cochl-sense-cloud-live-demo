@@ -11,9 +11,8 @@ import {
   RefreshCw,
   Square,
   Trash2,
-  UploadCloud,
 } from 'lucide-react';
-import { analyzeLiveChunk, analyzeRecording, endLiveSession } from './api';
+import { analyzeLiveChunk, endLiveSession } from './api';
 import { getAudioContextConstructor } from './audioContext';
 import { CollectedSessionsPanel } from './CollectedSessionsPanel';
 import { LiveSpectrogramPanel } from './LiveSpectrogramPanel';
@@ -29,6 +28,7 @@ import {
   liveTimelineEventsFromResponse,
   mergeLiveTimelineEvents,
   recordLiveDiagnostic,
+  retainRecentLiveTimelineEvents,
   resolveLiveViewport,
   type LiveDiagnostics,
   type LiveTimelineEvent,
@@ -43,10 +43,10 @@ import {
   liveChunkCsvFilename,
   liveChunkRecordsToCsv,
   markLiveChunkRequestStarted,
+  retainRecentLiveChunkRecords,
   upsertLiveChunkRecord,
   type LiveChunkRecord,
 } from './liveChunkRecords';
-import { fileFromRecordingChunks, selectSupportedMimeType } from './recorder';
 import type {
   AnalysisResponse,
   LiveChunkCollectionStatus,
@@ -56,20 +56,39 @@ import type {
 import { eventOverlayStyle, formatTime, peaksFromSamples } from './waveform';
 import './App.css';
 
-type RecorderStatus = 'idle' | 'starting' | 'recording' | 'ready' | 'uploading' | 'complete' | 'error';
+type RecorderStatus = 'idle' | 'starting' | 'recording' | 'complete' | 'error';
 type SegmentPlaybackMode = 'loading' | 'buffer' | 'native';
+type ExtendedMediaTrackConstraints = MediaTrackConstraints & {
+  voiceIsolation?: ConstrainBoolean;
+};
+type ExtendedMediaTrackSettings = MediaTrackSettings & {
+  voiceIsolation?: boolean;
+};
 
 const LIVE_WINDOW_SEC = 2;
 const LIVE_HOP_SEC = 1;
+const LIVE_AUDIO_SAMPLE_RATE_HZ = 48_000;
+const LIVE_MICROPHONE_AUDIO_CONSTRAINTS: ExtendedMediaTrackConstraints = {
+  channelCount: { ideal: 1 },
+  sampleRate: { ideal: LIVE_AUDIO_SAMPLE_RATE_HZ },
+  echoCancellation: { exact: false },
+  noiseSuppression: { exact: false },
+  autoGainControl: { exact: false },
+  voiceIsolation: { exact: false },
+};
+const LIVE_MICROPHONE_CONSTRAINTS: MediaStreamConstraints = {
+  audio: LIVE_MICROPHONE_AUDIO_CONSTRAINTS,
+};
 const LIVE_MAX_IN_FLIGHT = 10;
 const LIVE_CONFIDENCE_THRESHOLD = 0.5;
 const LIVE_VIEWPORT_SEC = 20;
 const LIVE_SPECTROGRAM_FPS = 12;
 const LIVE_SPECTROGRAM_BINS = 64;
 const LIVE_HISTORY_LIMIT = 6;
-const LIVE_COLLECTED_REFRESH_MS = 5000;
 const LIVE_REQUEST_TIMEOUT_MS = 60_000;
 const MAX_LIVE_SPECTROGRAM_FRAMES = 12_000;
+const LIVE_UI_HISTORY_RETENTION_SEC = 60 * 60;
+const COLLECTION_SUMMARY_DISPLAY_LIMIT = 100;
 
 interface LiveCollectionCounts {
   collected: number;
@@ -112,10 +131,7 @@ interface LiveLatencySample {
 export default function App() {
   const [status, setStatus] = useState<RecorderStatus>('idle');
   const [elapsedSec, setElapsedSec] = useState(0);
-  const [recordingFile, setRecordingFile] = useState<File | null>(null);
-  const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selectedMimeType, setSelectedMimeType] = useState('');
   const liveSpectrogramFramesRef = useRef<LiveSpectrogramFrame[]>([]);
   const [liveSpectrogramVersion, setLiveSpectrogramVersion] = useState(0);
   const [liveTimelineEvents, setLiveTimelineEvents] = useState<LiveTimelineEvent[]>([]);
@@ -134,8 +150,6 @@ export default function App() {
   const [sessionName, setSessionName] = useState('');
   const [compactMode, setCompactMode] = useState(false);
   const sessionNameRef = useRef('');
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
   const startedAtRef = useRef<number | null>(null);
   const recordingSessionRef = useRef(0);
@@ -180,6 +194,7 @@ export default function App() {
     return () => {
       const liveSessionToken = liveSessionTokenRef.current;
       stopLiveCapture({ clearTimeline: false, invalidateSession: true });
+      stopTracks();
       void finalizeLiveSession(liveSessionToken, { showSummary: false });
     };
   }, []);
@@ -210,9 +225,8 @@ export default function App() {
 
   async function startRecording() {
     setError(null);
-    setAnalysis(null);
 
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    if (!navigator.mediaDevices?.getUserMedia) {
       setStatus('error');
       setError('마이크 녹음을 지원하지 않는 브라우저입니다.');
       return;
@@ -220,84 +234,34 @@ export default function App() {
 
     setStatus('starting');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = selectSupportedMimeType();
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const stream = await navigator.mediaDevices.getUserMedia(LIVE_MICROPHONE_CONSTRAINTS);
+      streamRef.current = stream;
+      assertAutomaticVoiceProcessingDisabled(stream);
       const sessionId = recordingSessionRef.current + 1;
 
       recordingSessionRef.current = sessionId;
-      chunksRef.current = [];
-      streamRef.current = stream;
-      recorderRef.current = recorder;
       setElapsedSec(0);
-      await startLiveCapture(stream, sessionId);
       startedAtRef.current = Date.now();
-      setSelectedMimeType(mimeType || recorder.mimeType || 'browser default');
-      setRecordingFile(null);
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.onstop = () => {
-        if (sessionId !== recordingSessionRef.current) {
-          return;
-        }
-        const file = fileFromRecordingChunks(
-          chunksRef.current,
-          mimeType || recorder.mimeType || 'audio/webm',
-        );
-        if (!file.size) {
-          setStatus('error');
-          setError('녹음된 오디오가 비어 있습니다.');
-          return;
-        }
-
-        setRecordingFile(file);
-        setStatus('ready');
-      };
-
-      recorder.start();
+      await startLiveCapture(stream, sessionId);
       setStatus('recording');
     } catch (err) {
       setStatus('error');
       setError(err instanceof Error ? err.message : '마이크 권한을 가져오지 못했습니다.');
       stopLiveCapture({ clearTimeline: false, invalidateSession: true });
       stopTracks();
+      startedAtRef.current = null;
     }
   }
 
   function completeRecording() {
-    const recorder = recorderRef.current;
-    if (!recorder || recorder.state === 'inactive') {
+    if (status !== 'recording') {
       return;
     }
     const liveSessionToken = liveSessionTokenRef.current;
     stopLiveCapture({ clearTimeline: false, invalidateSession: false });
-    recorder.stop();
     stopTracks();
+    setStatus('complete');
     void finalizeLiveSession(liveSessionToken, { showSummary: true });
-  }
-
-  async function submitRecording() {
-    if (!recordingFile) {
-      setError('업로드할 녹음 파일이 없습니다.');
-      return;
-    }
-
-    setStatus('uploading');
-    setError(null);
-
-    try {
-      const result = await analyzeRecording(recordingFile);
-      setAnalysis(result);
-      setStatus('complete');
-    } catch (err) {
-      setStatus('ready');
-      setError(err instanceof Error ? err.message : '분석 요청에 실패했습니다.');
-    }
   }
 
   function discardRecording() {
@@ -305,18 +269,10 @@ export default function App() {
     recordingSessionRef.current += 1;
     stopLiveCapture({ clearTimeline: true, invalidateSession: true });
     void finalizeLiveSession(liveSessionToken, { showSummary: false });
-    if (recorderRef.current?.state === 'recording') {
-      recorderRef.current.stop();
-    }
     stopTracks();
-    chunksRef.current = [];
-    recorderRef.current = null;
     startedAtRef.current = null;
     setElapsedSec(0);
-    setRecordingFile(null);
-    setAnalysis(null);
     setError(null);
-    setSelectedMimeType('');
     setStatus('idle');
   }
 
@@ -333,6 +289,7 @@ export default function App() {
         stream,
         (window) => handleLiveWindow(window, liveSessionToken),
         {
+          sampleRate: LIVE_AUDIO_SAMPLE_RATE_HZ,
           windowSec: LIVE_WINDOW_SEC,
           hopSec: LIVE_HOP_SEC,
           onSpectrogramFrame: (frame) => handleLiveSpectrogramFrame(frame, liveSessionToken),
@@ -348,6 +305,7 @@ export default function App() {
     } catch (err) {
       liveCleanupRef.current = null;
       setLiveDiagnostics((current) => recordLiveDiagnostic(current, 'failure', 0, errorMessage(err)));
+      throw err;
     }
   }
 
@@ -437,7 +395,10 @@ export default function App() {
   }
 
   function upsertLiveChunkState(next: LiveChunkRecord) {
-    setLiveChunkRecords((current) => upsertLiveChunkRecord(current, next));
+    setLiveChunkRecords((current) => retainRecentLiveChunkRecords(
+      upsertLiveChunkRecord(current, next),
+      LIVE_UI_HISTORY_RETENTION_SEC,
+    ));
   }
 
   function handleLiveWindow(window: LiveAudioWindow, liveSessionToken: string) {
@@ -543,8 +504,12 @@ export default function App() {
       }
 
       const timelineEvents = liveTimelineEventsFromResponse(response, LIVE_CONFIDENCE_THRESHOLD);
+      setLiveTimelineEvents((current) => retainRecentLiveTimelineEvents(
+        timelineEvents.length ? mergeLiveTimelineEvents(current, timelineEvents) : current,
+        currentRecord.windowEndSec,
+        LIVE_UI_HISTORY_RETENTION_SEC,
+      ));
       if (timelineEvents.length) {
-        setLiveTimelineEvents((current) => mergeLiveTimelineEvents(current, timelineEvents));
         const detectedEvents = response.sound_events.filter(
           (event) => typeof event.confidence === 'number' && event.confidence >= LIVE_CONFIDENCE_THRESHOLD,
         );
@@ -680,11 +645,9 @@ export default function App() {
   const canStart =
     !collectionFinalizing && (status === 'idle' || status === 'error' || status === 'complete');
   const canComplete = status === 'recording';
-  const canSubmit = status === 'ready' && !collectionFinalizing;
   const canDiscard =
-    !collectionFinalizing && status !== 'uploading' && status !== 'starting' && status !== 'idle';
-  const canDownloadCsv =
-    (status === 'ready' || status === 'uploading' || status === 'complete') && liveChunkRecords.length > 0;
+    !collectionFinalizing && status !== 'starting' && status !== 'idle';
+  const canDownloadCsv = status === 'complete' && liveChunkRecords.length > 0;
   const hasCollectionActivity =
     liveCollectionCounts.collected > 0 ||
     liveCollectionCounts.discardedSilent > 0 ||
@@ -781,8 +744,9 @@ export default function App() {
             {durationLabel}
           </div>
           <div className="meta-row">
-            <span>완료 후 업로드</span>
-            <span>{selectedMimeType || '녹음 대기'}</span>
+            <span>중요 구간만 자동 저장</span>
+            <span>원본 저장 안 함 · 화면 이력 최근 60분</span>
+            <span>입력 48 kHz · 모노 · 음성 보정 끔</span>
             {(status === 'recording' || hasCollectionActivity) && (
               <span
                 aria-label="실시간 데이터 수집 현황"
@@ -840,23 +804,12 @@ export default function App() {
               <Square size={18} aria-hidden="true" />
               완료
             </button>
-            <button type="button" onClick={submitRecording} disabled={!canSubmit}>
-              <UploadCloud size={18} aria-hidden="true" />
-              분석
-            </button>
             <button type="button" onClick={discardRecording} disabled={!canDiscard}>
               <Trash2 size={18} aria-hidden="true" />
               폐기
             </button>
           </div>
         </div>
-
-        {status === 'uploading' && (
-          <div className="notice progress" role="status">
-            <RefreshCw size={18} aria-hidden="true" />
-            녹음 파일을 Cochl.Sense Cloud API로 분석하고 있습니다.
-          </div>
-        )}
 
         {collectionFinalizing && (
           <div className="notice progress" role="status">
@@ -874,11 +827,8 @@ export default function App() {
 
         {collectionSummary && <CollectionSummaryPanel summary={collectionSummary} />}
 
-        {analysis && <AnalysisPanel analysis={analysis} recordingFile={recordingFile} />}
-
         <CollectedSessionsPanel
           refreshToken={collectedRefreshToken}
-          autoRefreshMs={status === 'recording' ? LIVE_COLLECTED_REFRESH_MS : undefined}
         />
         </div>
       </section>
@@ -909,6 +859,26 @@ function errorMessage(err: unknown): string | undefined {
   return err instanceof Error ? err.message : undefined;
 }
 
+function assertAutomaticVoiceProcessingDisabled(stream: MediaStream) {
+  const audioTrack = typeof stream.getAudioTracks === 'function'
+    ? stream.getAudioTracks()[0]
+    : undefined;
+  if (!audioTrack || typeof audioTrack.getSettings !== 'function') {
+    return;
+  }
+
+  const settings = audioTrack.getSettings() as ExtendedMediaTrackSettings;
+  const enabled = [
+    settings.echoCancellation === true ? '에코 제거' : null,
+    settings.noiseSuppression === true ? '노이즈 억제' : null,
+    settings.autoGainControl === true ? '자동 게인' : null,
+    settings.voiceIsolation === true ? 'Voice Isolation' : null,
+  ].filter((label): label is string => label !== null);
+  if (enabled.length) {
+    throw new Error(`자동 음성 보정을 끌 수 없습니다: ${enabled.join(', ')}`);
+  }
+}
+
 function positiveRoundedMs(value: number): number {
   return Math.max(0, Math.round(value));
 }
@@ -934,6 +904,7 @@ function formatLatency(milliseconds: number): string {
 
 function CollectionSummaryPanel({ summary }: { summary: LiveSessionEndResponse }) {
   const hasSegments = summary.segment_count > 0;
+  const displayedSegments = summary.segments.slice(-COLLECTION_SUMMARY_DISPLAY_LIMIT);
 
   return (
     <section className="collection-summary" aria-labelledby="collection-summary-title">
@@ -954,7 +925,7 @@ function CollectionSummaryPanel({ summary }: { summary: LiveSessionEndResponse }
       </p>
       {hasSegments ? (
         <ul className="collection-segment-list">
-          {summary.segments.map((segment) => (
+          {displayedSegments.map((segment) => (
             <li key={segment.segment_index} className="collection-segment-item">
               <span className="collection-segment-index">#{segment.segment_index}</span>
               <span className="collection-segment-range">
@@ -969,6 +940,12 @@ function CollectionSummaryPanel({ summary }: { summary: LiveSessionEndResponse }
       ) : (
         <p className="collection-summary-empty">
           수집된 세그먼트가 없습니다. 의미 있는 소리가 감지된 구간만 저장됩니다.
+        </p>
+      )}
+      {summary.segments.length > displayedSegments.length && (
+        <p className="collection-summary-note">
+          장시간 세션의 화면 부하를 줄이기 위해 최근 {displayedSegments.length}개만 표시합니다.
+          전체 {summary.segment_count}개 파일은 아래 수집된 데이터에서 확인할 수 있습니다.
         </p>
       )}
       {hasSegments && (
@@ -999,8 +976,6 @@ function StatusBadge({ status }: { status: RecorderStatus }) {
     idle: '대기',
     starting: '마이크 준비 중',
     recording: '녹음 중',
-    ready: '업로드 준비',
-    uploading: '분석 중',
     complete: '완료',
     error: '확인 필요',
   };

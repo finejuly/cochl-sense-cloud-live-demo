@@ -10,6 +10,7 @@ import {
   liveChunkRecordsToCsv,
   markLiveChunkRequestStarted,
   renderLiveChunkRecords,
+  retainRecentLiveChunkRecords,
   upsertLiveChunkRecord,
   type LiveChunkRecord,
 } from './liveChunkRecords';
@@ -185,6 +186,28 @@ describe('live chunk record lifecycle', () => {
       [1, 'PENDING'],
       [2, 'SKIP'],
     ]);
+  });
+
+  it('retains one hour of completed rows without ever evicting pending requests', () => {
+    const skipped = (sequenceId: number, windowStartSec: number, windowEndSec: number) => (
+      createSkippedLiveChunkRecord({
+        sessionId: 'session:long',
+        sequenceId,
+        recordingStartedAtMs: RECORDING_STARTED_AT_MS,
+        windowStartSec,
+        windowEndSec,
+      })
+    );
+    const records = [
+      skipped(1, 0, 2),
+      pending({ sequenceId: 2, windowStartSec: 1, windowEndSec: 3 }),
+      skipped(3, 400, 402),
+      skipped(4, 4000, 4002),
+    ];
+
+    const retained = retainRecentLiveChunkRecords(records, 3600);
+
+    expect(retained.map((record) => record.sequenceId)).toEqual([2, 3, 4]);
   });
 });
 

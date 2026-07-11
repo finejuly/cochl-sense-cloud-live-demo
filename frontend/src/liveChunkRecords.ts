@@ -138,6 +138,26 @@ export function upsertLiveChunkRecord(
   return sortRecords(merged);
 }
 
+export function retainRecentLiveChunkRecords(
+  records: LiveChunkRecord[],
+  retentionSec: number,
+): LiveChunkRecord[] {
+  if (!records.length) {
+    return records;
+  }
+
+  const safeRetentionSec = Number.isFinite(retentionSec) ? Math.max(0, retentionSec) : 0;
+  const latestWindowEndSec = records.reduce(
+    (latest, record) => Math.max(latest, record.windowEndSec),
+    0,
+  );
+  const cutoffSec = latestWindowEndSec - safeRetentionSec;
+  const retained = records.filter((record) => (
+    record.status === 'PENDING' || record.windowEndSec >= cutoffSec
+  ));
+  return retained.length === records.length ? records : retained;
+}
+
 export function renderLiveChunkRecords(
   records: LiveChunkRecord[],
   viewport: LiveTimelineViewport,

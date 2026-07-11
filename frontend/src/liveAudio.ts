@@ -32,6 +32,7 @@ export function appendCompactedSpectrogramFrame(
 }
 
 export interface LiveAudioCaptureOptions {
+  sampleRate?: number;
   windowSec?: number;
   hopSec?: number;
   onSpectrogramFrame?: (frame: LiveSpectrogramFrame) => void;
@@ -132,7 +133,14 @@ export async function createLiveAudioCapture(
     throw new Error('Web Audio API is not supported.');
   }
 
-  const context = new AudioContextCtor();
+  const requestedSampleRate = positiveIntegerOrNull(options.sampleRate);
+  const context = requestedSampleRate === null
+    ? new AudioContextCtor()
+    : new AudioContextCtor({ sampleRate: requestedSampleRate });
+  if (requestedSampleRate !== null && context.sampleRate !== requestedSampleRate) {
+    await context.close().catch(() => undefined);
+    throw new Error(`${requestedSampleRate} Hz 오디오 처리를 지원하지 않는 환경입니다.`);
+  }
   const source = context.createMediaStreamSource(stream);
   const analyser = context.createAnalyser();
   const buffer = new LiveWindowBuffer({
@@ -314,6 +322,13 @@ function sanitizePositiveInteger(value: number | undefined, fallback: number): n
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? Math.max(1, Math.floor(value))
     : fallback;
+}
+
+function positiveIntegerOrNull(value: number | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return Math.max(1, Math.round(value));
 }
 
 function nextPowerOfTwo(value: number): number {

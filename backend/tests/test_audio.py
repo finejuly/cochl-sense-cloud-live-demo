@@ -2,6 +2,7 @@ from backend.app.audio import (
     COCHL_SUPPORTED_CONTENT_TYPES,
     PreparedAudio,
     UploadTooLargeError,
+    convert_to_mp3,
     extension_for_content_type,
     is_cochl_supported_audio,
     prepare_audio_for_cochl,
@@ -57,3 +58,36 @@ def test_prepare_audio_converts_unsupported_file(tmp_path, monkeypatch):
     assert prepared.content_type == "audio/wav"
     assert prepared.path.read_bytes() == b"wav"
     assert converted_paths == [(source, prepared.path)]
+
+
+def test_convert_to_mp3_uses_44100_hz_mono_128_kbps(tmp_path, monkeypatch):
+    source = tmp_path / "clip.wav"
+    output = tmp_path / "clip.mp3"
+    calls = []
+
+    monkeypatch.setattr("backend.app.audio.shutil.which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        "backend.app.audio.subprocess.run",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+
+    convert_to_mp3(source, output)
+
+    assert calls == [
+        (
+            [
+                "/usr/bin/ffmpeg",
+                "-y",
+                "-i",
+                str(source),
+                "-ar",
+                "44100",
+                "-ac",
+                "1",
+                "-b:a",
+                "128k",
+                str(output),
+            ],
+            {"check": True, "capture_output": True, "text": True},
+        )
+    ]

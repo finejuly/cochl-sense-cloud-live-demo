@@ -95,4 +95,30 @@ describe('createLiveAudioCapture', () => {
     expect(worklet?.disconnect).toHaveBeenCalled();
     expect(context?.close).toHaveBeenCalled();
   });
+
+  it('requires the AudioContext to honor an explicitly requested sample rate', async () => {
+    const close = vi.fn(async () => undefined);
+    const constructorOptions: Array<AudioContextOptions | undefined> = [];
+
+    class FakeAudioContext {
+      sampleRate = 44_100;
+      close = close;
+
+      constructor(options?: AudioContextOptions) {
+        constructorOptions.push(options);
+      }
+    }
+
+    Object.defineProperty(window, 'AudioContext', {
+      configurable: true,
+      value: FakeAudioContext,
+    });
+
+    await expect(createLiveAudioCapture({} as MediaStream, vi.fn(), {
+      sampleRate: 48_000,
+    })).rejects.toThrow('48000 Hz 오디오 처리를 지원하지 않는 환경입니다.');
+
+    expect(constructorOptions).toEqual([{ sampleRate: 48_000 }]);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
 });

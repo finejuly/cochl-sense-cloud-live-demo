@@ -110,6 +110,20 @@ export function mergeLiveTimelineEvents(
   return sortEvents(merged);
 }
 
+export function retainRecentLiveTimelineEvents(
+  events: LiveTimelineEvent[],
+  referenceTimeSec: number,
+  retentionSec: number,
+): LiveTimelineEvent[] {
+  const safeReferenceTimeSec = Number.isFinite(referenceTimeSec)
+    ? Math.max(0, referenceTimeSec)
+    : 0;
+  const safeRetentionSec = Number.isFinite(retentionSec) ? Math.max(0, retentionSec) : 0;
+  const cutoffSec = safeReferenceTimeSec - safeRetentionSec;
+  const retained = events.filter((event) => event.endTimeSec >= cutoffSec);
+  return retained.length === events.length ? events : retained;
+}
+
 export function renderLiveTimelineEvents(
   events: LiveTimelineEvent[],
   viewport: LiveTimelineViewport,
