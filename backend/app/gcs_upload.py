@@ -12,6 +12,8 @@ from tempfile import TemporaryDirectory
 from typing import Any, Callable, Literal, Protocol
 from uuid import uuid4
 
+from backend.app.segment_files import sorted_segment_metadata_paths
+
 GCS_SCOPE = "https://www.googleapis.com/auth/devstorage.read_write"
 MANIFEST_FILENAME = "manifest.json"
 UPLOAD_MARKER_FILENAME = ".gcs-upload.json"
@@ -334,7 +336,7 @@ def _collect_upload_files(session_dir: Path, snapshot_dir: Path) -> list[_Upload
     if not session_path.is_file():
         raise FileNotFoundError(session_path)
 
-    metadata_paths = sorted(session_dir.glob("segment-*.json"))
+    metadata_paths = sorted_segment_metadata_paths(session_dir)
     if not metadata_paths:
         raise ValueError("The collected session has no segments to upload.")
 

@@ -764,7 +764,7 @@ export default function App() {
                 aria-label="실시간 데이터 수집 현황"
                 title="의미 있는 소리 구간만 저장합니다. 무음과 음성(프라이버시) 구간은 제외됩니다."
               >
-                수집 {liveCollectionCounts.collected} · 무음 제외 {liveCollectionCounts.discardedSilent} · 음성 제외{' '}
+                수집 후보 청크 {liveCollectionCounts.collected} · 무음 제외 {liveCollectionCounts.discardedSilent} · 음성 제외{' '}
                 {liveCollectionCounts.discardedSpeech} · 종료 후 제외 {liveCollectionCounts.discardedLate}
               </span>
             )}
@@ -932,8 +932,16 @@ function CollectionSummaryPanel({ summary }: { summary: LiveSessionEndResponse }
         </p>
       )}
       <p className="collection-summary-stats">
-        세그먼트 {summary.segment_count}개 · 총 {summary.total_collected_duration_sec.toFixed(1)}초 저장 · 무음 제외{' '}
-        {summary.discarded_silent_chunk_count}개 · 음성(프라이버시) 제외 {summary.discarded_speech_chunk_count}개
+        후보 {summary.candidate_segment_count}개 · 선택 {summary.segment_count}개 · 총{' '}
+        {summary.total_collected_duration_sec.toFixed(1)}초 저장 · 반복 제외{' '}
+        {summary.rejected_repetitive_count}개 · 클래스 균형 제외{' '}
+        {summary.rejected_class_balance_count}개 · 세션 상한 제외{' '}
+        {summary.rejected_session_budget_count}개
+      </p>
+      <p className="collection-summary-stats">
+        무음 제외 {summary.discarded_silent_chunk_count}개 · 음성(프라이버시) 제외{' '}
+        {summary.discarded_speech_chunk_count}개 · 손상 오디오 제외 {summary.invalid_audio_count}개 · 저장 오류{' '}
+        {summary.write_error_count}개
       </p>
       {hasSegments ? (
         <ul className="collection-segment-list">

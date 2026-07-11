@@ -13,6 +13,14 @@ from threading import Lock
 from time import monotonic
 
 from backend.app.config import Settings
+from backend.app.curation import (
+    CandidateFeatures,
+    CurationDecision,
+    CurationPolicy,
+    ObservedEvent,
+    SegmentCurator,
+    build_candidate_features,
+)
 from backend.app.gcs_upload import UPLOAD_MARKER_FILENAME
 from backend.app.models import (
     CollectedSegmentSummary,
@@ -20,6 +28,11 @@ from backend.app.models import (
     GcsUploadStatus,
     LiveSessionEndResponse,
     SoundEvent,
+)
+from backend.app.segment_files import (
+    make_segment_stem,
+    resolve_segment_audio,
+    sorted_segment_metadata_paths,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +55,7 @@ class CollectionPolicy:
     max_segment_sec: float = 20.0
     silence_close_sec: float = 5.0
     reorder_hold_back_sec: float = DEFAULT_REORDER_HOLD_BACK_SEC
+    curation: CurationPolicy = field(default_factory=CurationPolicy)
 
 
 def policy_from_settings(settings: Settings) -> CollectionPolicy:
@@ -51,6 +65,13 @@ def policy_from_settings(settings: Settings) -> CollectionPolicy:
         min_segment_sec=settings.collection_min_segment_sec,
         max_segment_sec=settings.collection_max_segment_sec,
         silence_close_sec=settings.collection_silence_close_sec,
+        curation=CurationPolicy(
+            max_segments=settings.collection_max_selected_segments,
+            max_duration_sec=settings.collection_max_selected_duration_sec,
+            max_audio_bytes=settings.collection_max_selected_audio_mb * 1024 * 1024,
+            repeat_cooldown_sec=settings.collection_repeat_cooldown_sec,
+            max_quota_label_share=settings.collection_max_quota_label_share,
+        ),
     )
 
 
@@ -119,7 +140,9 @@ class SegmentCollector:
         self._segment_chunks: list[_ChunkEntry] = []
         self._context_buffer: list[_ChunkEntry] = []
         self._segment_index = 0
+        self._candidate_index = 0
         self._segments: list[CollectedSegmentSummary] = []
+        self._curator = SegmentCurator(policy.curation)
         self._kept_chunk_count = 0
         self._discarded_silent_count = 0
         self._discarded_speech_count = 0
@@ -173,6 +196,7 @@ class SegmentCollector:
         return summary
 
     def _build_summary(self, *, ended: bool) -> LiveSessionEndResponse:
+        curation = self._curator.summary()
         return LiveSessionEndResponse(
             session_id=self.session_id,
             session_name=self.session_name,
@@ -186,6 +210,7 @@ class SegmentCollector:
             discarded_silent_chunk_count=self._discarded_silent_count,
             discarded_speech_chunk_count=self._discarded_speech_count,
             segments=list(self._segments),
+            **curation.__dict__,
         )
 
     def _process_entry(self, entry: _ChunkEntry) -> None:
@@ -209,7 +234,10 @@ class SegmentCollector:
                 entry.window_end_sec - segment_start
                 > self.policy.max_segment_sec + _TIME_EPSILON_SEC
             ):
-                self._finalize_current_segment("max_duration")
+                self._finalize_current_segment(
+                    "max_duration",
+                    clip_end_sec=entry.window_start_sec,
+                )
             elif (
                 entry.window_start_sec > current_end + _TIME_EPSILON_SEC
                 and not self._bridge_context_to(entry)
@@ -360,7 +388,12 @@ class SegmentCollector:
             self._delete_chunk_file(chunk)
         self._context_buffer = []
 
-    def _finalize_current_segment(self, reason: str) -> None:
+    def _finalize_current_segment(
+        self,
+        reason: str,
+        *,
+        clip_end_sec: float | None = None,
+    ) -> None:
         chunks = self._segment_chunks
         self._segment_chunks = []
         if not chunks:
@@ -369,70 +402,149 @@ class SegmentCollector:
         # minimum length from leftover leading context.
         chunks = self._prepend_context(chunks)
 
+        self._candidate_index += 1
+        candidate_id = self._candidate_index
+        start_sec = min(chunk.window_start_sec for chunk in chunks)
+        end_sec = min(
+            max(chunk.window_end_sec for chunk in chunks),
+            clip_end_sec if clip_end_sec is not None else float("inf"),
+        )
+        merge_result = _merge_chunk_audio(chunks, clip_end_sec=clip_end_sec)
+        if merge_result.audio is None or merge_result.skipped_sequence_ids:
+            self._curator.record_invalid_audio(
+                candidate_id,
+                start_sec,
+                end_sec,
+                merge_result.skipped_sequence_ids,
+            )
+            self._append_decision_record(
+                {
+                    "candidate_id": candidate_id,
+                    "start_sec": round(start_sec, 3),
+                    "end_sec": round(end_sec, 3),
+                    "selected": False,
+                    "reason": "invalid_audio",
+                    "skipped_sequence_ids": list(merge_result.skipped_sequence_ids),
+                    "policy_version": self.policy.curation.policy_version,
+                }
+            )
+            self._delete_chunks(chunks)
+            self._write_session_summary(self._build_summary(ended=False))
+            return
+
+        merged = merge_result.audio
+        duration_sec = len(merged.frames) / (
+            merged.nchannels * merged.sampwidth * merged.framerate
+        )
+        observations = self._observed_events(
+            chunks,
+            consumed_sequence_ids=merge_result.consumed_sequence_ids,
+            clip_end_sec=clip_end_sec,
+        )
         try:
-            merged = _merge_chunk_audio(chunks)
-        except Exception:
+            candidate = build_candidate_features(
+                candidate_id=candidate_id,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                duration_sec=duration_sec,
+                estimated_audio_bytes=len(merged.frames) + 44,
+                observations=observations,
+                confidence_threshold=self.policy.confidence_threshold,
+            )
+        except ValueError:
             logger.exception(
-                "Failed to merge %d collected chunks for session %s.",
-                len(chunks),
+                "Candidate %d for session %s has no usable event tracks.",
+                candidate_id,
                 self.session_id,
             )
-            for chunk in chunks:
-                self._delete_chunk_file(chunk)
+            self._curator.record_invalid_audio(candidate_id, start_sec, end_sec, ())
+            self._append_decision_record(
+                {
+                    "candidate_id": candidate_id,
+                    "start_sec": round(start_sec, 3),
+                    "end_sec": round(end_sec, 3),
+                    "selected": False,
+                    "reason": "invalid_audio",
+                    "skipped_sequence_ids": [],
+                    "policy_version": self.policy.curation.policy_version,
+                }
+            )
+            self._delete_chunks(chunks)
+            self._write_session_summary(self._build_summary(ended=False))
+            return
+
+        decision = self._curator.evaluate(candidate)
+        if not decision.selected:
+            self._curator.record_rejected(candidate, decision)
+            self._append_decision_record(
+                self._decision_record(candidate, decision)
+            )
+            self._delete_chunks(chunks)
+            self._write_session_summary(self._build_summary(ended=False))
             return
 
         segment_index = self._segment_index + 1
-        start_sec = min(chunk.window_start_sec for chunk in chunks)
-        end_sec = max(chunk.window_end_sec for chunk in chunks)
-        stem = f"segment-{segment_index:03d}-{start_sec:.3f}-{end_sec:.3f}"
+        stem = make_segment_stem(segment_index, start_sec, end_sec)
         wav_path = self.output_dir / f"{stem}.wav"
         metadata_path = self.output_dir / f"{stem}.json"
+        temporary_wav = self.output_dir / f".{stem}.wav.tmp"
+        temporary_metadata = self.output_dir / f".{stem}.json.tmp"
 
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            _write_wav(wav_path, merged)
-            metadata_path.write_text(
+            _write_wav(temporary_wav, merged)
+            temporary_metadata.write_text(
                 json.dumps(
                     self._segment_metadata(
-                        chunks,
+                        candidate,
+                        decision,
                         segment_index=segment_index,
-                        start_sec=start_sec,
-                        end_sec=end_sec,
                         sample_rate=merged.framerate,
                         audio_filename=wav_path.name,
                         reason=reason,
+                        chunk_sequence_ids=merge_result.consumed_sequence_ids,
                     ),
                     ensure_ascii=False,
                     indent=2,
                 ),
                 encoding="utf-8",
             )
+            temporary_wav.replace(wav_path)
+            temporary_metadata.replace(metadata_path)
         except OSError:
             logger.exception(
                 "Failed to write collected segment %s for session %s.",
                 stem,
                 self.session_id,
             )
+            temporary_wav.unlink(missing_ok=True)
+            temporary_metadata.unlink(missing_ok=True)
             wav_path.unlink(missing_ok=True)
             metadata_path.unlink(missing_ok=True)
-            for chunk in chunks:
-                self._delete_chunk_file(chunk)
+            self._curator.record_write_error(candidate)
+            self._append_decision_record(
+                self._decision_record(candidate, decision, reason="write_error")
+            )
+            self._delete_chunks(chunks)
+            self._write_session_summary(self._build_summary(ended=False))
             return
 
-        for chunk in chunks:
-            self._delete_chunk_file(chunk)
-
+        self._curator.commit_selected(candidate, decision)
+        self._delete_chunks(chunks)
         self._segment_index = segment_index
         self._segments.append(
             CollectedSegmentSummary(
                 segment_index=segment_index,
                 start_sec=round(start_sec, 3),
                 end_sec=round(end_sec, 3),
-                duration_sec=round(end_sec - start_sec, 3),
-                event_count=sum(len(chunk.events) for chunk in chunks),
-                labels=_sorted_unique_labels(chunks, self.policy.confidence_threshold),
+                duration_sec=round(duration_sec, 3),
+                event_count=len(candidate.tracks),
+                labels=sorted({track.label for track in candidate.tracks}),
                 audio_filename=wav_path.name,
                 metadata_filename=metadata_path.name,
+                primary_label=candidate.primary_label,
+                quota_label=decision.quota_label,
+                selection_reason=decision.reason,
             )
         )
         if self.mp3_scheduler is not None:
@@ -440,51 +552,64 @@ class SegmentCollector:
                 self.mp3_scheduler(wav_path)
             except Exception:
                 logger.exception("Could not schedule MP3 conversion for %s.", wav_path)
-        if not self._ended:
-            # Keep session.json current so mid-recording listings show the
-            # session name and start time alongside the new segment.
-            self._write_session_summary(self._build_summary(ended=False))
+        self._write_session_summary(self._build_summary(ended=False))
 
     def _segment_metadata(
         self,
-        chunks: list[_ChunkEntry],
+        candidate: CandidateFeatures,
+        decision: CurationDecision,
         *,
         segment_index: int,
-        start_sec: float,
-        end_sec: float,
         sample_rate: int,
         audio_filename: str,
         reason: str,
+        chunk_sequence_ids: tuple[int, ...],
     ) -> dict:
         return {
             "session_id": self.session_id,
             "session_name": self.session_name,
             "session_started_at": self.started_at.isoformat(),
             "segment_index": segment_index,
-            "start_sec": round(start_sec, 3),
-            "end_sec": round(end_sec, 3),
-            "duration_sec": round(end_sec - start_sec, 3),
+            "start_sec": round(candidate.start_sec, 3),
+            "end_sec": round(candidate.end_sec, 3),
+            "duration_sec": round(candidate.duration_sec, 3),
             "sample_rate": sample_rate,
             "audio_filename": audio_filename,
             "finalize_reason": reason,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "chunk_sequence_ids": [chunk.sequence_id for chunk in chunks],
+            "chunk_sequence_ids": list(chunk_sequence_ids),
             "events": [
-                {**event.model_dump(), "source_sequence_id": chunk.sequence_id}
-                for chunk in chunks
-                for event in chunk.events
+                {
+                    "start_time_sec": round(track.start_sec, 3),
+                    "end_time_sec": round(track.end_sec, 3),
+                    "label": track.label,
+                    "confidence": track.max_confidence,
+                    "supporting_window_count": track.supporting_window_count,
+                }
+                for track in candidate.tracks
             ],
+            "curation": {
+                "policy_version": decision.policy_version,
+                "candidate_id": candidate.candidate_id,
+                "signature": list(candidate.signature),
+                "primary_label": candidate.primary_label,
+                "quota_label": decision.quota_label,
+                "selection_reason": decision.reason,
+            },
         }
 
     def _write_session_summary(self, summary: LiveSessionEndResponse) -> None:
-        if not self._segments:
+        if summary.candidate_segment_count == 0 and not summary.segments:
             return
+        temporary = self.output_dir / ".session.json.tmp"
+        destination = self.output_dir / "session.json"
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            (self.output_dir / "session.json").write_text(
+            payload = summary.model_dump(exclude={"segments"})
+            temporary.write_text(
                 json.dumps(
                     {
-                        **summary.model_dump(),
+                        **payload,
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     },
                     ensure_ascii=False,
@@ -492,10 +617,85 @@ class SegmentCollector:
                 ),
                 encoding="utf-8",
             )
+            temporary.replace(destination)
         except OSError:
+            temporary.unlink(missing_ok=True)
             logger.exception(
                 "Failed to write session summary for session %s.", self.session_id
             )
+
+    def _observed_events(
+        self,
+        chunks: list[_ChunkEntry],
+        *,
+        consumed_sequence_ids: tuple[int, ...],
+        clip_end_sec: float | None,
+    ) -> list[ObservedEvent]:
+        consumed = set(consumed_sequence_ids)
+        observations: list[ObservedEvent] = []
+        for chunk in chunks:
+            if chunk.sequence_id not in consumed:
+                continue
+            for event in chunk.events:
+                # normalize_sound_events already offsets live events onto the
+                # session timeline before they reach the collector.
+                start_sec = event.start_time_sec
+                end_sec = event.end_time_sec
+                if clip_end_sec is not None:
+                    end_sec = min(end_sec, clip_end_sec)
+                if end_sec <= start_sec:
+                    continue
+                observations.append(
+                    ObservedEvent(
+                        source_sequence_id=chunk.sequence_id,
+                        start_sec=start_sec,
+                        end_sec=end_sec,
+                        label=event.label,
+                        confidence=event.confidence,
+                    )
+                )
+        return observations
+
+    def _decision_record(
+        self,
+        candidate: CandidateFeatures,
+        decision: CurationDecision,
+        *,
+        reason: str | None = None,
+    ) -> dict:
+        summary = self._curator.summary()
+        return {
+            "candidate_id": candidate.candidate_id,
+            "start_sec": round(candidate.start_sec, 3),
+            "end_sec": round(candidate.end_sec, 3),
+            "signature": list(candidate.signature),
+            "primary_label": candidate.primary_label,
+            "quota_label": decision.quota_label,
+            "selected": False,
+            "reason": reason or decision.reason,
+            "policy_version": decision.policy_version,
+            "budget": {
+                "selected_segments": summary.policy_selected_segment_count,
+                "selected_duration_sec": summary.policy_selected_duration_sec,
+                "selected_audio_bytes": summary.policy_selected_audio_bytes,
+            },
+        }
+
+    def _append_decision_record(self, record: dict) -> None:
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            with (self.output_dir / "decisions.jsonl").open(
+                "a", encoding="utf-8"
+            ) as destination:
+                destination.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            logger.exception(
+                "Failed to append curation decision for session %s.", self.session_id
+            )
+
+    def _delete_chunks(self, chunks: Sequence[_ChunkEntry]) -> None:
+        for chunk in chunks:
+            self._delete_chunk_file(chunk)
 
     def _delete_chunk_file(self, entry: _ChunkEntry) -> None:
         try:
@@ -520,18 +720,37 @@ class _MergedAudio:
     frames: bytes
 
 
-def _merge_chunk_audio(chunks: list[_ChunkEntry]) -> _MergedAudio:
+@dataclass(frozen=True)
+class _MergeResult:
+    audio: _MergedAudio | None
+    consumed_sequence_ids: tuple[int, ...]
+    skipped_sequence_ids: tuple[int, ...]
+
+
+def _merge_chunk_audio(
+    chunks: list[_ChunkEntry],
+    *,
+    clip_end_sec: float | None = None,
+) -> _MergeResult:
     """Concatenate overlapping WAV windows into one continuous PCM stream.
 
     Windows overlap (2 s window, 1 s hop), so each chunk after the first
     only contributes the frames past the previous max window end. Chunks
-    with mismatched WAV params or unreadable data are skipped, not fatal.
+    The result reports every skipped source so the caller can fail closed.
     """
     merged: bytearray | None = None
     params: tuple[int, int, int] | None = None
     prev_end_sec = 0.0
+    consumed_sequence_ids: list[int] = []
+    skipped_sequence_ids: list[int] = []
 
     for chunk in chunks:
+        effective_end_sec = min(
+            chunk.window_end_sec,
+            clip_end_sec if clip_end_sec is not None else float("inf"),
+        )
+        if effective_end_sec <= chunk.window_start_sec + _TIME_EPSILON_SEC:
+            continue
         try:
             with wave.open(str(chunk.wav_path), "rb") as reader:
                 chunk_params = (
@@ -542,12 +761,25 @@ def _merge_chunk_audio(chunks: list[_ChunkEntry]) -> _MergedAudio:
                 frames = reader.readframes(reader.getnframes())
         except (OSError, wave.Error, EOFError):
             logger.exception("Skipping unreadable live chunk %s.", chunk.wav_path)
+            skipped_sequence_ids.append(chunk.sequence_id)
+            continue
+
+        nchannels, sampwidth, framerate = chunk_params
+        bytes_per_frame = nchannels * sampwidth
+        effective_frame_count = max(
+            0,
+            round((effective_end_sec - chunk.window_start_sec) * framerate),
+        )
+        frames = frames[: effective_frame_count * bytes_per_frame]
+        if not frames:
+            skipped_sequence_ids.append(chunk.sequence_id)
             continue
 
         if merged is None:
             merged = bytearray(frames)
             params = chunk_params
-            prev_end_sec = chunk.window_end_sec
+            prev_end_sec = effective_end_sec
+            consumed_sequence_ids.append(chunk.sequence_id)
             continue
 
         if chunk_params != params:
@@ -557,6 +789,7 @@ def _merge_chunk_audio(chunks: list[_ChunkEntry]) -> _MergedAudio:
                 chunk_params,
                 params,
             )
+            skipped_sequence_ids.append(chunk.sequence_id)
             continue
 
         nchannels, sampwidth, framerate = params
@@ -565,16 +798,25 @@ def _merge_chunk_audio(chunks: list[_ChunkEntry]) -> _MergedAudio:
         skip_bytes = max(0, round(overlap_sec * framerate)) * bytes_per_frame
         if skip_bytes < len(frames):
             merged.extend(frames[skip_bytes:])
-        prev_end_sec = max(prev_end_sec, chunk.window_end_sec)
+        prev_end_sec = max(prev_end_sec, effective_end_sec)
+        consumed_sequence_ids.append(chunk.sequence_id)
 
     if merged is None or params is None:
-        raise ValueError("No readable audio chunks to merge.")
+        return _MergeResult(
+            audio=None,
+            consumed_sequence_ids=tuple(consumed_sequence_ids),
+            skipped_sequence_ids=tuple(skipped_sequence_ids),
+        )
     nchannels, sampwidth, framerate = params
-    return _MergedAudio(
-        nchannels=nchannels,
-        sampwidth=sampwidth,
-        framerate=framerate,
-        frames=bytes(merged),
+    return _MergeResult(
+        audio=_MergedAudio(
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            frames=bytes(merged),
+        ),
+        consumed_sequence_ids=tuple(consumed_sequence_ids),
+        skipped_sequence_ids=tuple(skipped_sequence_ids),
     )
 
 
@@ -584,17 +826,6 @@ def _write_wav(path: Path, audio: _MergedAudio) -> None:
         writer.setsampwidth(audio.sampwidth)
         writer.setframerate(audio.framerate)
         writer.writeframes(audio.frames)
-
-
-def _sorted_unique_labels(chunks: list[_ChunkEntry], confidence_threshold: float) -> list[str]:
-    return sorted(
-        {
-            event.label
-            for chunk in chunks
-            for event in chunk.events
-            if event.confidence is None or event.confidence >= confidence_threshold
-        }
-    )
 
 
 class LiveCollectionManager:
@@ -732,17 +963,28 @@ def list_collected_sessions(collected_root: Path) -> list[CollectedSessionInfo]:
 
 
 def _load_collected_session(session_dir: Path) -> CollectedSessionInfo | None:
+    session_payload: dict = {}
+    session_json = session_dir / "session.json"
+    if session_json.is_file():
+        try:
+            loaded = json.loads(session_json.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                session_payload = loaded
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Skipping unreadable session summary %s.", session_json)
+
     segments: list[CollectedSegmentSummary] = []
-    for metadata_path in sorted(session_dir.glob("segment-*.json")):
+    for metadata_path in sorted_segment_metadata_paths(session_dir):
         try:
             data = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             logger.warning("Skipping unreadable segment metadata %s.", metadata_path)
             continue
-        audio_filename = _resolve_segment_audio(session_dir, metadata_path.stem)
-        if audio_filename is None:
+        audio_path = resolve_segment_audio(session_dir, metadata_path.stem)
+        if audio_path is None:
             continue
         events = data.get("events") or []
+        curation = data.get("curation") or {}
         segments.append(
             CollectedSegmentSummary(
                 segment_index=int(data.get("segment_index") or len(segments) + 1),
@@ -757,36 +999,68 @@ def _load_collected_session(session_dir: Path) -> CollectedSessionInfo | None:
                         if isinstance(event, dict) and event.get("label")
                     }
                 ),
-                audio_filename=audio_filename,
+                audio_filename=audio_path.name,
                 metadata_filename=metadata_path.name,
+                primary_label=curation.get("primary_label"),
+                quota_label=curation.get("quota_label"),
+                selection_reason=curation.get("selection_reason") or "legacy",
             )
         )
-    if not segments:
+    if not segments and not session_payload:
         return None
 
-    session_name = started_at = ended_at = None
-    session_json = session_dir / "session.json"
-    if session_json.is_file():
-        try:
-            payload = json.loads(session_json.read_text(encoding="utf-8"))
-            session_name = payload.get("session_name")
-            started_at = payload.get("started_at")
-            ended_at = payload.get("ended_at")
-        except (OSError, json.JSONDecodeError):
-            logger.warning("Skipping unreadable session summary %s.", session_json)
+    selected_label_segment_counts: dict[str, int] = {}
+    selected_quota_duration_sec: dict[str, float] = {}
+    for segment in segments:
+        for label in segment.labels:
+            selected_label_segment_counts[label] = (
+                selected_label_segment_counts.get(label, 0) + 1
+            )
+        if segment.quota_label:
+            selected_quota_duration_sec[segment.quota_label] = round(
+                selected_quota_duration_sec.get(segment.quota_label, 0.0)
+                + segment.duration_sec,
+                3,
+            )
 
     gcs_upload = _load_gcs_upload_status(session_dir)
     return CollectedSessionInfo(
         session_id=session_dir.name,
-        session_name=session_name,
-        started_at=started_at,
-        ended_at=ended_at,
+        session_name=session_payload.get("session_name"),
+        started_at=session_payload.get("started_at"),
+        ended_at=session_payload.get("ended_at"),
         segment_count=len(segments),
         total_collected_duration_sec=round(
             sum(segment.duration_sec for segment in segments), 3
         ),
         segments=segments,
         gcs_upload=gcs_upload,
+        candidate_segment_count=int(
+            session_payload.get("candidate_segment_count") or 0
+        ),
+        policy_selected_segment_count=int(
+            session_payload.get("policy_selected_segment_count") or 0
+        ),
+        policy_selected_duration_sec=float(
+            session_payload.get("policy_selected_duration_sec") or 0.0
+        ),
+        policy_selected_audio_bytes=int(
+            session_payload.get("policy_selected_audio_bytes") or 0
+        ),
+        rejected_repetitive_count=int(
+            session_payload.get("rejected_repetitive_count") or 0
+        ),
+        rejected_class_balance_count=int(
+            session_payload.get("rejected_class_balance_count") or 0
+        ),
+        rejected_session_budget_count=int(
+            session_payload.get("rejected_session_budget_count") or 0
+        ),
+        invalid_audio_count=int(session_payload.get("invalid_audio_count") or 0),
+        write_error_count=int(session_payload.get("write_error_count") or 0),
+        selected_label_segment_counts=selected_label_segment_counts,
+        selected_quota_duration_sec=selected_quota_duration_sec,
+        policy_version=session_payload.get("policy_version"),
     )
 
 
@@ -800,13 +1074,6 @@ def _load_gcs_upload_status(session_dir: Path) -> GcsUploadStatus | None:
     except (OSError, json.JSONDecodeError, ValueError):
         logger.warning("Ignoring unreadable GCS upload marker %s.", marker)
         return None
-
-
-def _resolve_segment_audio(session_dir: Path, stem: str) -> str | None:
-    for suffix in (".mp3", ".wav"):
-        if (session_dir / f"{stem}{suffix}").is_file():
-            return f"{stem}{suffix}"
-    return None
 
 
 def delete_collected_session(collected_root: Path, session_id: str) -> bool:
@@ -834,7 +1101,38 @@ def delete_collected_segment(
         if target.is_file():
             target.unlink(missing_ok=True)
             deleted = True
-    if deleted and not any(session_dir.glob("segment-*.json")):
-        # Last segment removed — drop the now-empty session directory.
-        shutil.rmtree(session_dir, ignore_errors=True)
+    if deleted:
+        session_json = session_dir / "session.json"
+        if not session_json.is_file():
+            if not any(session_dir.glob("segment-*.json")):
+                shutil.rmtree(session_dir, ignore_errors=True)
+            return True
+        session = _load_collected_session(session_dir)
+        if session is not None:
+            try:
+                payload = json.loads(session_json.read_text(encoding="utf-8"))
+                payload.update(
+                    {
+                        "segment_count": session.segment_count,
+                        "total_collected_duration_sec": (
+                            session.total_collected_duration_sec
+                        ),
+                        "selected_label_segment_counts": (
+                            session.selected_label_segment_counts
+                        ),
+                        "selected_quota_duration_sec": (
+                            session.selected_quota_duration_sec
+                        ),
+                    }
+                )
+                temporary = session_dir / ".session.json.tmp"
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temporary.replace(session_json)
+            except (OSError, json.JSONDecodeError):
+                logger.exception(
+                    "Failed to update session summary after deleting %s.", filename
+                )
     return deleted

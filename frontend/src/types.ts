@@ -65,9 +65,27 @@ export interface CollectedSegmentSummary {
   labels: string[];
   audio_filename: string;
   metadata_filename: string;
+  primary_label?: string | null;
+  quota_label?: string | null;
+  selection_reason?: string | null;
 }
 
-export interface LiveSessionEndResponse {
+export interface CurationAggregates {
+  candidate_segment_count: number;
+  policy_selected_segment_count: number;
+  policy_selected_duration_sec: number;
+  policy_selected_audio_bytes: number;
+  rejected_repetitive_count: number;
+  rejected_class_balance_count: number;
+  rejected_session_budget_count: number;
+  invalid_audio_count: number;
+  write_error_count: number;
+  selected_label_segment_counts: Record<string, number>;
+  selected_quota_duration_sec: Record<string, number>;
+  policy_version?: number | null;
+}
+
+export interface LiveSessionEndResponse extends CurationAggregates {
   session_id: string;
   session_name?: string | null;
   started_at?: string | null;
@@ -80,7 +98,7 @@ export interface LiveSessionEndResponse {
   segments: CollectedSegmentSummary[];
 }
 
-export interface CollectedSessionInfo {
+export interface CollectedSessionInfo extends CurationAggregates {
   session_id: string;
   session_name: string | null;
   started_at: string | null;

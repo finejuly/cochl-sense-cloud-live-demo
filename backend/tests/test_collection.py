@@ -1,6 +1,7 @@
 import json
 import struct
 import wave
+from pathlib import Path
 
 from backend.app.collection import (
     CHUNK_COLLECTED,
@@ -19,6 +20,7 @@ from backend.app.collection import (
     safe_collected_session_dir,
 )
 from backend.app.config import Settings
+from backend.app.curation import CurationPolicy
 from backend.app.models import SoundEvent
 
 FRAMERATE = 100
@@ -31,6 +33,7 @@ POLICY = CollectionPolicy(
     min_segment_sec=0.0,
     max_segment_sec=20.0,
     reorder_hold_back_sec=100.0,
+    curation=CurationPolicy(repeat_cooldown_sec=0),
 )
 
 PADDING_POLICY = CollectionPolicy(
@@ -39,6 +42,7 @@ PADDING_POLICY = CollectionPolicy(
     min_segment_sec=5.0,
     max_segment_sec=20.0,
     reorder_hold_back_sec=100.0,
+    curation=CurationPolicy(repeat_cooldown_sec=0),
 )
 
 
@@ -194,12 +198,165 @@ def test_collector_writes_segment_metadata(tmp_path):
             "end_time_sec": 5.0,
             "label": "Knock",
             "confidence": 0.8,
-            "source_sequence_id": 7,
+            "supporting_window_count": 1,
         }
     ]
     assert segment.labels == ["Knock"]
     session_summary = json.loads((output_dir / "session.json").read_text("utf-8"))
     assert session_summary["segment_count"] == 1
+    assert session_summary["candidate_segment_count"] == 1
+    assert session_summary["policy_selected_segment_count"] == 1
+    assert "segments" not in session_summary
+
+
+def test_collector_journals_repetitive_rejection_but_not_selected(tmp_path):
+    policy = CollectionPolicy(
+        confidence_threshold=0.5,
+        exclude_label_keywords=("speech",),
+        min_segment_sec=0.0,
+        max_segment_sec=20.0,
+        reorder_hold_back_sec=100.0,
+        curation=CurationPolicy(repeat_cooldown_sec=600),
+    )
+    output_dir = tmp_path / "collected"
+    collector = SegmentCollector("session-a", output_dir, policy)
+    add_chunk(collector, tmp_path / "live", 1, 0, 2, [event()])
+    add_chunk(collector, tmp_path / "live", 2, 4, 6, [event(start=4, end=5)])
+
+    summary = collector.end_session()
+    decisions = [
+        json.loads(line)
+        for line in (output_dir / "decisions.jsonl").read_text("utf-8").splitlines()
+    ]
+
+    assert summary.candidate_segment_count == 2
+    assert summary.segment_count == 1
+    assert summary.rejected_repetitive_count == 1
+    assert [decision["reason"] for decision in decisions] == ["repetitive"]
+
+
+def test_collector_rejects_mismatched_audio_as_invalid(tmp_path):
+    policy = CollectionPolicy(
+        confidence_threshold=0.5,
+        exclude_label_keywords=("speech",),
+        min_segment_sec=0.0,
+        max_segment_sec=20.0,
+        reorder_hold_back_sec=100.0,
+    )
+    output_dir = tmp_path / "collected"
+    chunks_dir = tmp_path / "live"
+    collector = SegmentCollector("session-a", output_dir, policy)
+    first = chunks_dir / "chunk-000001.wav"
+    second = chunks_dir / "chunk-000002.wav"
+    write_ramp_chunk(first, 0, 2, framerate=100)
+    write_ramp_chunk(second, 1, 3, framerate=200)
+    collector.add_chunk(
+        sequence_id=1,
+        window_start_sec=0,
+        window_end_sec=2,
+        wav_path=first,
+        events=[event()],
+    )
+    collector.add_chunk(
+        sequence_id=2,
+        window_start_sec=1,
+        window_end_sec=3,
+        wav_path=second,
+        events=[event(start=1, end=2)],
+    )
+
+    summary = collector.end_session()
+    decision = json.loads(
+        (output_dir / "decisions.jsonl").read_text("utf-8").splitlines()[0]
+    )
+
+    assert summary.segment_count == 0
+    assert summary.invalid_audio_count == 1
+    assert decision["reason"] == "invalid_audio"
+    assert decision["skipped_sequence_ids"] == [2]
+    assert not first.exists()
+    assert not second.exists()
+
+
+def test_all_rejected_session_is_listed_with_zero_segments(tmp_path):
+    output_dir = tmp_path / "collected" / "session-a"
+    policy = CollectionPolicy(
+        confidence_threshold=0.5,
+        exclude_label_keywords=("speech",),
+        min_segment_sec=0.0,
+        max_segment_sec=20.0,
+        reorder_hold_back_sec=100.0,
+        curation=CurationPolicy(max_duration_sec=1.0),
+    )
+    collector = SegmentCollector("session-a", output_dir, policy)
+    add_chunk(collector, tmp_path / "live", 1, 0, 2, [event()])
+
+    summary = collector.end_session()
+    listed = list_collected_sessions(tmp_path / "collected")
+
+    assert summary.segment_count == 0
+    assert summary.rejected_session_budget_count == 1
+    assert len(listed) == 1
+    assert listed[0].segment_count == 0
+    assert listed[0].candidate_segment_count == 1
+
+
+def test_write_failure_rolls_back_pair_and_records_terminal_outcome(
+    tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "collected"
+    collector = SegmentCollector("session-a", output_dir, POLICY)
+    _, source = add_chunk(collector, tmp_path / "live", 1, 0, 2, [event()])
+    original_write_text = Path.write_text
+
+    def fail_segment_metadata(path, *args, **kwargs):
+        if path.name.startswith(".segment-") and path.name.endswith(".json.tmp"):
+            raise OSError("injected metadata failure")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_segment_metadata)
+
+    summary = collector.end_session()
+    decisions = [
+        json.loads(line)
+        for line in (output_dir / "decisions.jsonl").read_text("utf-8").splitlines()
+    ]
+
+    assert summary.segment_count == 0
+    assert summary.write_error_count == 1
+    assert decisions[0]["reason"] == "write_error"
+    assert not list(output_dir.glob("segment-*"))
+    assert not source.exists()
+
+
+def test_journal_append_failure_keeps_reject_count_and_cleanup(
+    tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "collected"
+    policy = CollectionPolicy(
+        confidence_threshold=0.5,
+        exclude_label_keywords=("speech",),
+        min_segment_sec=0.0,
+        max_segment_sec=20.0,
+        reorder_hold_back_sec=100.0,
+        curation=CurationPolicy(max_duration_sec=1.0),
+    )
+    collector = SegmentCollector("session-a", output_dir, policy)
+    _, source = add_chunk(collector, tmp_path / "live", 1, 0, 2, [event()])
+    original_open = Path.open
+
+    def fail_journal(path, *args, **kwargs):
+        if path.name == "decisions.jsonl":
+            raise OSError("injected journal failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_journal)
+
+    summary = collector.end_session()
+
+    assert summary.rejected_session_budget_count == 1
+    assert summary.segment_count == 0
+    assert not source.exists()
 
 
 def test_collector_splits_segments_on_time_gap(tmp_path):
@@ -308,6 +465,7 @@ def test_collector_splits_segments_at_max_duration(tmp_path):
         min_segment_sec=0.0,
         max_segment_sec=4.0,
         reorder_hold_back_sec=100.0,
+        curation=CurationPolicy(repeat_cooldown_sec=0),
     )
     collector = SegmentCollector("session-a", tmp_path / "collected", policy)
 
@@ -321,7 +479,10 @@ def test_collector_splits_segments_at_max_duration(tmp_path):
     assert summary.segment_count == 2
     assert [
         (segment.start_sec, segment.end_sec) for segment in summary.segments
-    ] == [(0.0, 4.0), (3.0, 5.0)]
+    ] == [(0.0, 3.0), (3.0, 5.0)]
+    first = read_wav_values(tmp_path / "collected" / summary.segments[0].audio_filename)
+    second = read_wav_values(tmp_path / "collected" / summary.segments[1].audio_filename)
+    assert first + second == list(range(500))
 
 
 def test_collector_orders_out_of_order_chunks_before_merging(tmp_path):
@@ -759,13 +920,16 @@ def test_delete_collected_session_removes_directory(tmp_path):
     assert delete_collected_session(collected, "../session-a") is False
 
 
-def test_delete_collected_segment_removes_files_and_empty_session(tmp_path):
+def test_delete_collected_segment_preserves_empty_curated_session(tmp_path):
     summary = make_collected_session(tmp_path, "session-a")
     collected = tmp_path / "collected"
     segment = summary.segments[0]
 
     assert delete_collected_segment(collected, "session-a", segment.audio_filename)
-    assert not (collected / "session-a").exists()
+    assert (collected / "session-a").exists()
+    session = list_collected_sessions(collected)[0]
+    assert session.segment_count == 0
+    assert session.policy_selected_segment_count == 1
 
 
 def test_delete_collected_segment_rejects_bad_names(tmp_path):
