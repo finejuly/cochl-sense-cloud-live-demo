@@ -2,7 +2,7 @@
 #import <WebKit/WebKit.h>
 #import <signal.h>
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler>
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic, strong) WKWebView *webView;
 @property(nonatomic, strong) NSTextField *statusLabel;
@@ -13,6 +13,9 @@
 @property(nonatomic, copy) NSString *serverHost;
 @property(nonatomic, assign) NSInteger serverPort;
 @property(nonatomic, assign) BOOL isQuitting;
+@property(nonatomic, assign) BOOL compactWindow;
+@property(nonatomic, assign) NSRect expandedWindowFrame;
+@property(nonatomic, assign) NSSize expandedWindowMinSize;
 @end
 
 @implementation AppDelegate
@@ -32,6 +35,7 @@
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
   self.isQuitting = YES;
+  [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"windowMode"];
   [self stopServer];
 }
 
@@ -104,6 +108,8 @@
   WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
   configuration.preferences.javaScriptCanOpenWindowsAutomatically = YES;
   configuration.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
+  configuration.userContentController = [[WKUserContentController alloc] init];
+  [configuration.userContentController addScriptMessageHandler:self name:@"windowMode"];
 
   self.webView = [[WKWebView alloc] initWithFrame:NSZeroRect configuration:configuration];
   self.webView.navigationDelegate = self;
@@ -145,6 +151,62 @@
   self.window.delegate = self;
   [self.window center];
   [self.window makeKeyAndOrderFront:nil];
+}
+
+- (void)userContentController:(WKUserContentController *)userContentController
+      didReceiveScriptMessage:(WKScriptMessage *)message {
+  if (![message.name isEqualToString:@"windowMode"] ||
+      ![message.body isKindOfClass:[NSDictionary class]]) {
+    return;
+  }
+  id compactValue = ((NSDictionary *)message.body)[@"compact"];
+  if (![compactValue respondsToSelector:@selector(boolValue)]) {
+    return;
+  }
+  [self setCompactWindowEnabled:[compactValue boolValue]];
+}
+
+- (void)setCompactWindowEnabled:(BOOL)enabled {
+  if (!self.window || self.compactWindow == enabled) {
+    return;
+  }
+
+  if (enabled) {
+    self.expandedWindowFrame = self.window.frame;
+    self.expandedWindowMinSize = self.window.minSize;
+    self.compactWindow = YES;
+    self.window.minSize = NSMakeSize(360, 240);
+
+    NSRect currentFrame = self.window.frame;
+    NSRect targetFrame = [self.window frameRectForContentRect:NSMakeRect(0, 0, 400, 280)];
+    targetFrame.origin.x = NSMinX(currentFrame);
+    targetFrame.origin.y = NSMaxY(currentFrame) - NSHeight(targetFrame);
+
+    NSScreen *screen = self.window.screen ?: NSScreen.mainScreen;
+    if (screen) {
+      NSRect visibleFrame = screen.visibleFrame;
+      if (NSMinX(targetFrame) < NSMinX(visibleFrame)) {
+        targetFrame.origin.x = NSMinX(visibleFrame);
+      }
+      if (NSMaxX(targetFrame) > NSMaxX(visibleFrame)) {
+        targetFrame.origin.x = NSMaxX(visibleFrame) - NSWidth(targetFrame);
+      }
+      if (NSMinY(targetFrame) < NSMinY(visibleFrame)) {
+        targetFrame.origin.y = NSMinY(visibleFrame);
+      }
+      if (NSMaxY(targetFrame) > NSMaxY(visibleFrame)) {
+        targetFrame.origin.y = NSMaxY(visibleFrame) - NSHeight(targetFrame);
+      }
+    }
+    [self.window setFrame:targetFrame display:YES animate:YES];
+    return;
+  }
+
+  self.compactWindow = NO;
+  self.window.minSize = self.expandedWindowMinSize;
+  if (!NSEqualRects(self.expandedWindowFrame, NSZeroRect)) {
+    [self.window setFrame:self.expandedWindowFrame display:YES animate:YES];
+  }
 }
 
 - (void)startServer {

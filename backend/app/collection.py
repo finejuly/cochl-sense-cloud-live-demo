@@ -13,9 +13,11 @@ from threading import Lock
 from time import monotonic
 
 from backend.app.config import Settings
+from backend.app.gcs_upload import UPLOAD_MARKER_FILENAME
 from backend.app.models import (
     CollectedSegmentSummary,
     CollectedSessionInfo,
+    GcsUploadStatus,
     LiveSessionEndResponse,
     SoundEvent,
 )
@@ -773,6 +775,7 @@ def _load_collected_session(session_dir: Path) -> CollectedSessionInfo | None:
         except (OSError, json.JSONDecodeError):
             logger.warning("Skipping unreadable session summary %s.", session_json)
 
+    gcs_upload = _load_gcs_upload_status(session_dir)
     return CollectedSessionInfo(
         session_id=session_dir.name,
         session_name=session_name,
@@ -783,7 +786,20 @@ def _load_collected_session(session_dir: Path) -> CollectedSessionInfo | None:
             sum(segment.duration_sec for segment in segments), 3
         ),
         segments=segments,
+        gcs_upload=gcs_upload,
     )
+
+
+def _load_gcs_upload_status(session_dir: Path) -> GcsUploadStatus | None:
+    marker = session_dir / UPLOAD_MARKER_FILENAME
+    if not marker.is_file():
+        return None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        return GcsUploadStatus.model_validate(payload)
+    except (OSError, json.JSONDecodeError, ValueError):
+        logger.warning("Ignoring unreadable GCS upload marker %s.", marker)
+        return None
 
 
 def _resolve_segment_audio(session_dir: Path, stem: str) -> str | None:

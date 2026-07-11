@@ -713,6 +713,28 @@ def test_list_collected_sessions_reads_metadata_from_disk(tmp_path):
     assert newest.segments[0].audio_filename.endswith(".wav")
 
 
+def test_list_collected_sessions_restores_gcs_upload_status(tmp_path):
+    make_collected_session(tmp_path, "session-uploaded", name="업로드 완료")
+    marker = tmp_path / "collected" / "session-uploaded" / ".gcs-upload.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "status": "uploaded",
+                "object_prefix": "root/install/session/snapshot",
+                "snapshot_id": "snapshot",
+                "uploaded_at": "2026-07-10T12:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    session = list_collected_sessions(tmp_path / "collected")[0]
+
+    assert session.gcs_upload is not None
+    assert session.gcs_upload.status == "uploaded"
+    assert session.gcs_upload.snapshot_id == "snapshot"
+
+
 def test_list_collected_sessions_handles_missing_root(tmp_path):
     assert list_collected_sessions(tmp_path / "missing") == []
 

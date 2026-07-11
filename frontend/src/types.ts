@@ -88,8 +88,34 @@ export interface CollectedSessionInfo {
   segment_count: number;
   total_collected_duration_sec: number;
   segments: CollectedSegmentSummary[];
+  gcs_upload: GcsUploadStatus | null;
+}
+
+export interface GcsUploadStatus {
+  status: 'uploaded';
+  object_prefix: string;
+  snapshot_id: string;
+  uploaded_at: string;
 }
 
 export interface CollectedSessionsResponse {
   sessions: CollectedSessionInfo[];
+}
+
+export interface GcsSessionUploadResponse {
+  status: 'uploaded';
+  session_id: string;
+  object_prefix: string;
+  snapshot_id: string;
+  uploaded_file_count: number;
+  existing_file_count: number;
+  total_size_bytes: number;
+}
+
+export interface GcsUploadFileProgress {
+  object_name: string;
+  source_filename: string;
+  file_status: 'uploaded' | 'existing';
+  completed_file_count: number;
+  total_file_count: number;
 }

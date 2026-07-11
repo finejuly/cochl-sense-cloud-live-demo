@@ -3,7 +3,9 @@ import {
   AlertTriangle,
   CheckCircle2,
   Database,
+  Maximize2,
   Mic,
+  Minimize2,
   Pause,
   Play,
   RefreshCw,
@@ -130,6 +132,7 @@ export default function App() {
   const [collectionFinalizing, setCollectionFinalizing] = useState(false);
   const [collectedRefreshToken, setCollectedRefreshToken] = useState(0);
   const [sessionName, setSessionName] = useState('');
+  const [compactMode, setCompactMode] = useState(false);
   const sessionNameRef = useRef('');
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -180,6 +183,18 @@ export default function App() {
       void finalizeLiveSession(liveSessionToken, { showSummary: false });
     };
   }, []);
+
+  useEffect(() => {
+    if (status !== 'recording' && compactMode) {
+      setCompactMode(false);
+    }
+  }, [compactMode, status]);
+
+  useEffect(() => {
+    requestNativeWindowMode(compactMode);
+  }, [compactMode]);
+
+  useEffect(() => () => requestNativeWindowMode(false), []);
 
   const durationLabel = useMemo(() => formatDuration(elapsedSec), [elapsedSec]);
   const liveDurationSec = useMemo(() => {
@@ -677,14 +692,88 @@ export default function App() {
     liveCollectionCounts.discardedLate > 0;
 
   return (
-    <main className="app-shell">
-      <section className="workspace" aria-labelledby="app-title">
+    <main className={`app-shell${compactMode ? ' app-shell-compact' : ''}`}>
+      <section
+        className="workspace"
+        aria-labelledby={compactMode ? 'compact-recorder-title' : 'app-title'}
+      >
+        {compactMode && (
+          <section className="compact-recorder" aria-label="컴팩트 녹음 상태">
+            <header className="compact-recorder-header">
+              <div>
+                <p className="eyebrow">Cochl.Sense Cloud</p>
+                <h1 id="compact-recorder-title">
+                  {sessionName.trim() || '장시간 녹음'}
+                </h1>
+              </div>
+              <button
+                type="button"
+                className="compact-expand-button"
+                onClick={() => setCompactMode(false)}
+                aria-label="전체 화면으로 보기"
+              >
+                <Maximize2 size={16} aria-hidden="true" />
+                전체 보기
+              </button>
+            </header>
+            <div className="compact-recorder-timer" aria-live="polite">
+              {durationLabel}
+            </div>
+            <div className="compact-recorder-status" role="status" aria-live="polite">
+              <span className="compact-recording-indicator">
+                <span aria-hidden="true" />
+                녹음 중
+              </span>
+              <span>
+                {collectionFinalizing
+                  ? '마지막 데이터를 정리 중'
+                  : liveDiagnostics.failureCount > 0
+                    ? `실시간 분석 오류 ${liveDiagnostics.failureCount}건`
+                    : hasPendingLiveChunks
+                      ? '실시간 분석 처리 중'
+                      : '실시간 분석 동작 중'}
+              </span>
+            </div>
+            <p className="compact-collection-status">
+              수집 {liveCollectionCounts.collected} · 무음 제외{' '}
+              {liveCollectionCounts.discardedSilent} · 음성 제외{' '}
+              {liveCollectionCounts.discardedSpeech}
+            </p>
+            <button
+              className="primary compact-complete-button"
+              type="button"
+              onClick={completeRecording}
+              disabled={!canComplete}
+            >
+              <Square size={16} aria-hidden="true" />
+              녹음 완료
+            </button>
+          </section>
+        )}
+
+        <div
+          className="full-workspace"
+          aria-hidden={compactMode || undefined}
+          hidden={compactMode}
+        >
         <header className="workspace-header">
           <div>
             <p className="eyebrow">Cochl.Sense Cloud API</p>
             <h1 id="app-title">실시간 스트리밍 현황판</h1>
           </div>
-          <StatusBadge status={status} />
+          <div className="workspace-header-actions">
+            <StatusBadge status={status} />
+            {status === 'recording' && (
+              <button
+                type="button"
+                className="compact-mode-button"
+                onClick={() => setCompactMode(true)}
+              >
+                <Minimize2 size={16} aria-hidden="true" />
+                작게 보기
+              </button>
+            )}
+          </div>
         </header>
 
         <div className="recording-surface">
@@ -791,9 +880,29 @@ export default function App() {
           refreshToken={collectedRefreshToken}
           autoRefreshMs={status === 'recording' ? LIVE_COLLECTED_REFRESH_MS : undefined}
         />
+        </div>
       </section>
     </main>
   );
+}
+
+interface NativeWindowModeHandler {
+  postMessage(message: { compact: boolean }): void;
+}
+
+function requestNativeWindowMode(compact: boolean) {
+  const webkitWindow = window as Window & {
+    webkit?: {
+      messageHandlers?: {
+        windowMode?: NativeWindowModeHandler;
+      };
+    };
+  };
+  try {
+    webkitWindow.webkit?.messageHandlers?.windowMode?.postMessage({ compact });
+  } catch {
+    // The browser layout still provides compact mode when no native bridge is available.
+  }
 }
 
 function errorMessage(err: unknown): string | undefined {
