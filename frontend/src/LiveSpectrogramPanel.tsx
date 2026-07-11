@@ -9,7 +9,12 @@ import {
   useState,
 } from 'react';
 import { Download, ExternalLink } from 'lucide-react';
-import type { LiveSpectrogramFrame } from './liveAudio';
+import {
+  DEFAULT_MEL_SPECTROGRAM_MAX_HZ,
+  DEFAULT_MEL_SPECTROGRAM_MIN_HZ,
+  melFrequencyPositionPercent,
+  type LiveSpectrogramFrame,
+} from './liveAudio';
 import {
   renderLiveChunkRecords,
   type LiveChunkRecord,
@@ -47,6 +52,17 @@ interface LiveSpectrogramPanelProps {
 
 const MARKER_LANE_HEIGHT = 34;
 const CHUNK_LANE_HEIGHT = 24;
+const DEFAULT_MEL_BAND_COUNT = 64;
+const SPECTROGRAM_RENDER_FPS = 12;
+const FREQUENCY_TICKS_HZ = [16_000, 8_000, 4_000, 2_000, 1_000, 500, 250];
+const SPECTROGRAM_COLOR_STOPS = [
+  { position: 0, color: [7, 21, 29] },
+  { position: 0.18, color: [16, 54, 74] },
+  { position: 0.42, color: [20, 111, 120] },
+  { position: 0.65, color: [74, 168, 124] },
+  { position: 0.84, color: [213, 191, 98] },
+  { position: 1, color: [255, 241, 168] },
+] as const;
 
 export function LiveSpectrogramPanel({
   frames,
@@ -70,6 +86,14 @@ export function LiveSpectrogramPanel({
 }: LiveSpectrogramPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const currentFrames = framesRef?.current ?? frames;
+  const latestFrame = currentFrames.at(-1);
+  const minFrequencyHz = latestFrame?.minFrequencyHz ?? DEFAULT_MEL_SPECTROGRAM_MIN_HZ;
+  const maxFrequencyHz = latestFrame?.maxFrequencyHz ?? DEFAULT_MEL_SPECTROGRAM_MAX_HZ;
+  const melBandCount = latestFrame?.magnitudes.length || DEFAULT_MEL_BAND_COUNT;
+  const frequencyTicks = FREQUENCY_TICKS_HZ.filter(
+    (frequencyHz) => frequencyHz >= minFrequencyHz && frequencyHz <= maxFrequencyHz,
+  );
   const renderEvents = useMemo(() => renderLiveTimelineEvents(events, viewport), [events, viewport]);
   const renderChunks = useMemo(
     () => renderLiveChunkRecords(chunkRecords, viewport, chunkSnapshotMs),
@@ -125,11 +149,23 @@ export function LiveSpectrogramPanel({
   }
 
   return (
-    <section className="live-spectrogram-panel" aria-label="실시간 참조 타임라인">
+    <section className="live-spectrogram-panel" aria-label="실시간 멜 스펙트로그램 및 참조 타임라인">
       <div className="live-spectrogram-header">
-        <div>
-          <h2>실시간 참조 타임라인</h2>
-          <span>{formatTime(viewport.startSec)} - {formatTime(viewport.endSec)}</span>
+        <div className="live-spectrogram-heading">
+          <h2>실시간 멜 스펙트로그램</h2>
+          <div className="live-spectrogram-meta">
+            <span className="live-spectrogram-range">
+              {formatFrequencyRange(minFrequencyHz, maxFrequencyHz)} · {melBandCount} 멜 대역
+            </span>
+            <span className="live-spectrogram-legend" aria-label="에너지 색상 범례: 약함에서 강함">
+              <span>약함</span>
+              <i aria-hidden="true" />
+              <span>강함</span>
+            </span>
+          </div>
+          <span className="live-spectrogram-time">
+            {formatTime(viewport.startSec)} - {formatTime(viewport.endSec)}
+          </span>
         </div>
         <button type="button" onClick={onJumpToLatest} disabled={autoFollow}>
           최신으로 이동
@@ -140,7 +176,35 @@ export function LiveSpectrogramPanel({
         className="live-spectrogram-stage"
         style={{ '--live-marker-layer-height': `${markerLayerHeight}px` } as CSSProperties}
       >
-        <canvas ref={canvasRef} className="live-spectrogram-canvas" aria-label="실시간 스펙트로그램" />
+        <div className="live-spectrogram-plot">
+          <canvas
+            ref={canvasRef}
+            className="live-spectrogram-canvas"
+            aria-label={`실시간 스펙트로그램 (멜), ${formatFrequencyRange(minFrequencyHz, maxFrequencyHz)}`}
+          />
+          <div className="live-spectrogram-frequency-grid" aria-hidden="true">
+            {frequencyTicks.map((frequencyHz) => (
+              <span
+                key={frequencyHz}
+                className={`live-spectrogram-frequency-line${frequencyHz === maxFrequencyHz ? ' is-top' : ''}`}
+                style={{
+                  top: `${melFrequencyPositionPercent(
+                    frequencyHz,
+                    minFrequencyHz,
+                    maxFrequencyHz,
+                  )}%`,
+                }}
+              >
+                <span>{formatFrequency(frequencyHz)}</span>
+              </span>
+            ))}
+          </div>
+          {!currentFrames.length && !active && (
+            <p className="live-spectrogram-empty">
+              입력 소리의 멜 주파수 패턴이 표시됩니다.
+            </p>
+          )}
+        </div>
         <div className="live-marker-layer" style={{ height: markerLayerHeight }}>
           {renderEvents.map((event) => (
             <button
@@ -224,6 +288,7 @@ export function LiveSpectrogramPanel({
         {timeTicks.map((tick) => (
           <span
             key={tick}
+            className={tick % 10 === 0 ? 'live-time-tick-major' : 'live-time-tick-minor'}
             style={{ left: `${((tick - viewport.startSec) / viewportDurationSec) * 100}%` }}
           >
             {formatTime(tick)}
@@ -313,13 +378,19 @@ function drawSpectrogram(
   }
   context.setTransform(scale, 0, 0, scale, 0, 0);
   context.clearRect(0, 0, width, height);
-  context.fillStyle = '#101a22';
+  context.fillStyle = '#07151d';
   context.fillRect(0, 0, width, height);
 
-  framesInViewport(frames, viewport).forEach((frame) => {
+  const visibleFrames = framesInViewport(frames, viewport);
+  const defaultColumnWidth = width / Math.max(1, viewportDurationSec * SPECTROGRAM_RENDER_FPS);
+  visibleFrames.forEach((frame, frameIndex) => {
     const x = ((frame.timestampSec - viewport.startSec) / viewportDurationSec) * width;
     const binHeight = height / Math.max(1, frame.magnitudes.length);
-    const columnWidth = Math.max(1, width / Math.max(1, viewportDurationSec * 12));
+    const nextFrame = visibleFrames[frameIndex + 1];
+    const timeBasedWidth = nextFrame
+      ? ((nextFrame.timestampSec - frame.timestampSec) / viewportDurationSec) * width
+      : defaultColumnWidth;
+    const columnWidth = Math.max(1, Math.min(defaultColumnWidth * 2, timeBasedWidth + 0.5));
 
     frame.magnitudes.forEach((magnitude, index) => {
       context.fillStyle = colorForMagnitude(magnitude);
@@ -362,16 +433,31 @@ export function framesInViewport(
 }
 
 function colorForMagnitude(value: number): string {
-  if (value >= 0.72) {
-    return '#f0b84a';
+  const clamped = Math.max(0, Math.min(1, value));
+  const upperIndex = SPECTROGRAM_COLOR_STOPS.findIndex((stop) => stop.position >= clamped);
+  if (upperIndex <= 0) {
+    const [red, green, blue] = SPECTROGRAM_COLOR_STOPS[0].color;
+    return `rgb(${red}, ${green}, ${blue})`;
   }
-  if (value >= 0.38) {
-    return '#1aa39a';
+  const lowerStop = SPECTROGRAM_COLOR_STOPS[upperIndex - 1];
+  const upperStop = SPECTROGRAM_COLOR_STOPS[upperIndex];
+  const ratio = (clamped - lowerStop.position) / (upperStop.position - lowerStop.position);
+  const color = lowerStop.color.map((channel, index) => Math.round(
+    channel + (upperStop.color[index] - channel) * ratio,
+  ));
+  return `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+}
+
+function formatFrequencyRange(minFrequencyHz: number, maxFrequencyHz: number): string {
+  return `${formatFrequency(minFrequencyHz)}–${formatFrequency(maxFrequencyHz)}`;
+}
+
+function formatFrequency(frequencyHz: number): string {
+  if (frequencyHz >= 1_000) {
+    const kilohertz = frequencyHz / 1_000;
+    return `${Number.isInteger(kilohertz) ? kilohertz : kilohertz.toFixed(1)} kHz`;
   }
-  if (value >= 0.16) {
-    return '#165760';
-  }
-  return '#101a22';
+  return `${Math.round(frequencyHz)} Hz`;
 }
 
 function eventLabel(event: LiveTimelineEvent): string {

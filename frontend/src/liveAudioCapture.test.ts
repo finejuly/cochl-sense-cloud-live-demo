@@ -48,6 +48,7 @@ describe('createLiveAudioCapture', () => {
         fftSize: 128,
         frequencyBinCount: 64,
         getByteFrequencyData: vi.fn(),
+        getFloatFrequencyData: vi.fn((target: Float32Array) => target.fill(-45)),
       });
       audioWorklet = { addModule: vi.fn(async () => undefined) };
       close = vi.fn(async () => undefined);
@@ -76,16 +77,27 @@ describe('createLiveAudioCapture', () => {
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:worklet');
     const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
     const onWindow = vi.fn();
+    const onSpectrogramFrame = vi.fn();
 
     const cleanup = await createLiveAudioCapture({} as MediaStream, onWindow, {
       windowSec: 2,
       hopSec: 1,
+      onSpectrogramFrame,
     });
 
     expect(context?.audioWorklet.addModule).toHaveBeenCalledWith('blob:worklet');
     expect(revokeSpy).toHaveBeenCalledWith('blob:worklet');
     worklet?.port.onmessage?.({ data: Float32Array.from([0, 1, 2, 3, 4, 5, 6, 7]) } as MessageEvent<Float32Array>);
     expect(onWindow).toHaveBeenCalledTimes(1);
+    expect(context?.analyser.fftSize).toBe(2048);
+    expect((context?.analyser as AnalyserNode | undefined)?.smoothingTimeConstant).toBe(0.45);
+    expect(context?.analyser.getFloatFrequencyData).toHaveBeenCalledTimes(1);
+    expect(onSpectrogramFrame).toHaveBeenCalledTimes(1);
+    expect(onSpectrogramFrame.mock.calls[0][0]).toMatchObject({
+      timestampSec: 2,
+      scale: 'mel',
+    });
+    expect(onSpectrogramFrame.mock.calls[0][0].magnitudes).toHaveLength(64);
 
     cleanup();
 

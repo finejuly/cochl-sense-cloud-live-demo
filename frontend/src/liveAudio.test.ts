@@ -3,7 +3,8 @@ import {
   LiveWindowBuffer,
   appendCompactedSpectrogramFrame,
   encodePcm16Wav,
-  magnitudesFromFrequencyData,
+  melFrequencyPositionPercent,
+  melMagnitudesFromDecibels,
   type LiveSpectrogramFrame,
 } from './liveAudio';
 
@@ -68,16 +69,60 @@ describe('encodePcm16Wav', () => {
   });
 });
 
-describe('magnitudesFromFrequencyData', () => {
-  it('compresses analyzer bytes into normalized rounded buckets', () => {
-    const magnitudes = magnitudesFromFrequencyData(Uint8Array.from([0, 64, 128, 255]), 2);
+describe('melMagnitudesFromDecibels', () => {
+  const options = {
+    sampleRate: 48_000,
+    binCount: 64,
+    minFrequencyHz: 50,
+    maxFrequencyHz: 16_000,
+    minDecibels: -95,
+    maxDecibels: -25,
+  };
 
-    expect(magnitudes).toEqual([0.125, 0.751]);
+  it('maps low and high tones to distinct ordered mel bands', () => {
+    const lowTone = spectrumWithTone(500, -25);
+    const highTone = spectrumWithTone(8_000, -25);
+
+    const lowMagnitudes = melMagnitudesFromDecibels(lowTone, options);
+    const highMagnitudes = melMagnitudesFromDecibels(highTone, options);
+    const lowPeakIndex = indexOfMaximum(lowMagnitudes);
+    const highPeakIndex = indexOfMaximum(highMagnitudes);
+
+    expect(lowMagnitudes).toHaveLength(64);
+    expect(highMagnitudes).toHaveLength(64);
+    expect(lowPeakIndex).toBeLessThan(highPeakIndex);
+    expect(lowMagnitudes[lowPeakIndex]).toBeGreaterThan(0.7);
+    expect(highMagnitudes[highPeakIndex]).toBeGreaterThan(0.6);
+  });
+
+  it('normalizes the configured decibel range and clamps silence safely', () => {
+    const floor = new Float32Array(1024).fill(-95);
+    const ceiling = new Float32Array(1024).fill(-25);
+    const silence = new Float32Array(1024).fill(Number.NEGATIVE_INFINITY);
+
+    expect(melMagnitudesFromDecibels(floor, options)).toEqual(new Array(64).fill(0));
+    expect(melMagnitudesFromDecibels(ceiling, options)).toEqual(new Array(64).fill(1));
+    expect(melMagnitudesFromDecibels(silence, options)).toEqual(new Array(64).fill(0));
   });
 
   it('returns an empty array for empty input or non-positive bin counts', () => {
-    expect(magnitudesFromFrequencyData(Uint8Array.from([]), 2)).toEqual([]);
-    expect(magnitudesFromFrequencyData(Uint8Array.from([1, 2, 3]), 0)).toEqual([]);
+    expect(melMagnitudesFromDecibels(new Float32Array(), options)).toEqual([]);
+    expect(melMagnitudesFromDecibels(new Float32Array([1, 2, 3]), {
+      ...options,
+      binCount: 0,
+    })).toEqual([]);
+    expect(melMagnitudesFromDecibels(new Float32Array([1, 2, 3]), {
+      ...options,
+      sampleRate: 0,
+    })).toEqual([]);
+  });
+
+  it('places frequency guides from the top high band to the bottom low band', () => {
+    expect(melFrequencyPositionPercent(16_000)).toBeCloseTo(0);
+    expect(melFrequencyPositionPercent(50)).toBeCloseTo(100);
+    expect(melFrequencyPositionPercent(8_000)).toBeLessThan(
+      melFrequencyPositionPercent(1_000),
+    );
   });
 });
 
@@ -107,4 +152,19 @@ function readBlob(blob: Blob): Promise<ArrayBuffer> {
     reader.onload = () => resolve(reader.result as ArrayBuffer);
     reader.readAsArrayBuffer(blob);
   });
+}
+
+function spectrumWithTone(frequencyHz: number, decibels: number): Float32Array {
+  const sampleRate = 48_000;
+  const spectrum = new Float32Array(1024).fill(-95);
+  const frequencyPerBin = sampleRate / (spectrum.length * 2);
+  spectrum[Math.round(frequencyHz / frequencyPerBin)] = decibels;
+  return spectrum;
+}
+
+function indexOfMaximum(values: number[]): number {
+  return values.reduce(
+    (maximumIndex, value, index) => value > values[maximumIndex] ? index : maximumIndex,
+    0,
+  );
 }
