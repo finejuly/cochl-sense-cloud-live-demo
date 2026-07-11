@@ -1,6 +1,12 @@
 from urllib.parse import parse_qs
 
-from scripts.live_chunk_latency_probe import LocalApiRunner, live_session_end_url
+import pytest
+
+from scripts.live_chunk_latency_probe import (
+    LocalApiRunner,
+    labels_from_raw_result,
+    live_session_end_url,
+)
 
 
 def test_live_session_end_url_preserves_api_prefix():
@@ -49,3 +55,30 @@ def test_local_probe_finalizes_its_live_session(tmp_path, monkeypatch):
         "body": {"session_id": ["probe-session"]},
         "timeout": 7,
     }
+
+
+def test_direct_probe_reads_both_documented_sound_event_keys():
+    payload = {
+        "status": "success",
+        "results": [
+            {
+                "classes": [
+                    {"class": "Silence", "confidence": 0.0},
+                    {"class": "Knock", "confidence": 0.8},
+                ]
+            }
+        ],
+    }
+
+    assert labels_from_raw_result({"sense": payload}) == ["Silence 0%", "Knock 80%"]
+    assert labels_from_raw_result({"sound_event_detection": payload}) == [
+        "Silence 0%",
+        "Knock 80%",
+    ]
+
+
+def test_direct_probe_rejects_missing_or_malformed_service_payload():
+    with pytest.raises(ValueError, match="missing"):
+        labels_from_raw_result({})
+    with pytest.raises(ValueError, match="invalid"):
+        labels_from_raw_result({"sound_event_detection": {"results": {}}})

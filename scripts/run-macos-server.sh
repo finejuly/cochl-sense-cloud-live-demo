@@ -14,46 +14,10 @@ if [[ ! -f "$ROOT/frontend/dist/index.html" ]]; then
   exit 1
 fi
 
-PORT="$("$PYTHON" - <<'PY'
-import socket
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-    sock.bind(("127.0.0.1", 0))
-    print(sock.getsockname()[1])
-PY
-)"
-
 cd "$ROOT"
 
-"$PYTHON" -m uvicorn backend.app.main:app --host 127.0.0.1 --port "$PORT" &
-SERVER_PID=$!
-
-stop_server() {
-  if kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-    kill "$SERVER_PID" >/dev/null 2>&1 || true
-  fi
-}
-
-trap stop_server INT TERM EXIT
-
-for _ in {1..80}; do
-  if "$PYTHON" - "$PORT" <<'PY' >/dev/null 2>&1
-import json
-import sys
-from urllib.request import urlopen
-
-port = sys.argv[1]
-with urlopen(f"http://127.0.0.1:{port}/api/health", timeout=0.25) as response:
-    payload = json.loads(response.read().decode("utf-8"))
-    raise SystemExit(0 if payload.get("status") == "ok" else 1)
-PY
-  then
-    echo "Cochl.Sense Cloud Live Demo is running at http://127.0.0.1:$PORT"
-    wait "$SERVER_PID"
-    exit $?
-  fi
-  sleep 0.1
-done
-
-echo "Cochl.Sense Cloud Live Demo error: server did not become ready."
-exit 1
+# exec preserves NSTask's PID. The Python runner makes that PID a process-group
+# leader, holds the ephemeral listen socket continuously, and gives the same
+# socket to Uvicorn. The native wrapper can therefore terminate and reap the
+# complete server group without a find-free-port/bind race.
+exec "$PYTHON" "$ROOT/scripts/run_macos_server.py"

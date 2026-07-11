@@ -121,4 +121,104 @@ describe('createLiveAudioCapture', () => {
     expect(constructorOptions).toEqual([{ sampleRate: 48_000 }]);
     expect(close).toHaveBeenCalledTimes(1);
   });
+
+  it('resumes a suspended context and reports audio time and later state changes', async () => {
+    class FakeNode {
+      connect = vi.fn();
+      disconnect = vi.fn();
+    }
+
+    let context: FakeAudioContext | null = null;
+    let processor: FakeNode & {
+      onaudioprocess: ((event: AudioProcessingEvent) => void) | null;
+    } | null = null;
+
+    class FakeAudioContext {
+      sampleRate = 4;
+      state: AudioContextState = 'suspended';
+      destination = new FakeNode();
+      source = new FakeNode();
+      analyser = Object.assign(new FakeNode(), {
+        fftSize: 128,
+        frequencyBinCount: 64,
+        getByteFrequencyData: vi.fn(),
+      });
+      close = vi.fn(async () => {
+        this.state = 'closed';
+      });
+      resume = vi.fn(async () => {
+        this.state = 'running';
+      });
+      private stateListeners = new Set<EventListenerOrEventListenerObject>();
+
+      constructor() {
+        context = this;
+      }
+
+      createMediaStreamSource() {
+        return this.source;
+      }
+
+      createAnalyser() {
+        return this.analyser;
+      }
+
+      createScriptProcessor() {
+        processor = Object.assign(new FakeNode(), { onaudioprocess: null });
+        return processor;
+      }
+
+      addEventListener(_type: string, listener: EventListenerOrEventListenerObject) {
+        this.stateListeners.add(listener);
+      }
+
+      removeEventListener(_type: string, listener: EventListenerOrEventListenerObject) {
+        this.stateListeners.delete(listener);
+      }
+
+      dispatchStateChange() {
+        const event = new Event('statechange');
+        this.stateListeners.forEach((listener) => {
+          if (typeof listener === 'function') {
+            listener(event);
+          } else {
+            listener.handleEvent(event);
+          }
+        });
+      }
+    }
+
+    Object.defineProperty(window, 'AudioContext', {
+      configurable: true,
+      value: FakeAudioContext,
+    });
+    Object.defineProperty(globalThis, 'AudioWorkletNode', {
+      configurable: true,
+      value: undefined,
+    });
+    const onAudioTimeUpdate = vi.fn();
+    const onStateChange = vi.fn();
+
+    const controller = await createLiveAudioCapture({} as MediaStream, vi.fn(), {
+      onAudioTimeUpdate,
+      onStateChange,
+    });
+
+    expect(context?.resume).toHaveBeenCalledTimes(1);
+    expect(onStateChange).toHaveBeenLastCalledWith('running');
+    processor?.onaudioprocess?.({
+      inputBuffer: { getChannelData: () => Float32Array.from([0, 0, 0, 0]) },
+    } as AudioProcessingEvent);
+    expect(onAudioTimeUpdate).toHaveBeenCalledWith(1);
+
+    if (!context) {
+      throw new Error('Expected audio context');
+    }
+    context.state = 'suspended';
+    context.dispatchStateChange();
+    expect(onStateChange).toHaveBeenLastCalledWith('suspended');
+    await controller.resume();
+    expect(onStateChange).toHaveBeenLastCalledWith('running');
+    controller();
+  });
 });

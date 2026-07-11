@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 
 class UploadTooLargeError(ValueError):
@@ -53,6 +54,8 @@ CONTENT_TYPE_EXTENSIONS = {
     "audio/mp4": ".m4a",
 }
 
+FFMPEG_TIMEOUT_SEC = 120
+
 
 def normalized_content_type(content_type: str | None) -> str:
     if not content_type:
@@ -89,8 +92,18 @@ def prepare_audio_for_cochl(
             content_type=normalized,
         )
 
-    converted_path = source_path.with_suffix(".wav")
-    convert_to_wav(source_path, converted_path)
+    # Never derive the output as ``source.with_suffix('.wav')``: a WebM named
+    # clip.webm may be uploaded beside a user's existing clip.wav. Conversion
+    # is provider scratch data, so give it an unguessable hidden name and let
+    # the request lifecycle remove it after analysis.
+    converted_path = source_path.with_name(
+        f".{source_path.name}.{uuid4().hex}.cochl.wav"
+    )
+    try:
+        convert_to_wav(source_path, converted_path)
+    except Exception:
+        converted_path.unlink(missing_ok=True)
+        raise
     return PreparedAudio(
         path=converted_path,
         content_type="audio/wav",
@@ -108,6 +121,7 @@ def convert_to_wav(input_path: Path, output_path: Path) -> None:
         subprocess.run(
             [
                 ffmpeg,
+                "-nostdin",
                 "-y",
                 "-i",
                 str(input_path),
@@ -120,8 +134,9 @@ def convert_to_wav(input_path: Path, output_path: Path) -> None:
             check=True,
             capture_output=True,
             text=True,
+            timeout=FFMPEG_TIMEOUT_SEC,
         )
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise AudioConversionError("Failed to convert recording to WAV.") from exc
 
 
@@ -134,6 +149,7 @@ def convert_to_mp3(input_path: Path, output_path: Path) -> None:
         subprocess.run(
             [
                 ffmpeg,
+                "-nostdin",
                 "-y",
                 "-i",
                 str(input_path),
@@ -148,6 +164,7 @@ def convert_to_mp3(input_path: Path, output_path: Path) -> None:
             check=True,
             capture_output=True,
             text=True,
+            timeout=FFMPEG_TIMEOUT_SEC,
         )
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise AudioConversionError("Failed to convert recording to MP3.") from exc

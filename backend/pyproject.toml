@@ -7,7 +7,9 @@ name = "cochl-sense-cloud-live-demo-backend"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-  "cochl>=0.2.1",
+  # The provider targets IntegratedApi plus the still-supported SED Client from SDK 2.x.
+  # Do not accept a future major without an explicit compatibility review.
+  "cochl>=2.0,<3.0",
   "fastapi>=0.115.0",
   "google-cloud-storage>=2.19.0",
   "pydantic>=2.7.0",

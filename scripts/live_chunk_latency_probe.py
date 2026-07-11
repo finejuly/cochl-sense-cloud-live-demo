@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -17,6 +18,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 DEFAULT_LOCAL_URL = "http://127.0.0.1:8000/api/analyze-live-chunk"
 
@@ -61,7 +65,11 @@ def main() -> int:
         return 2
 
     session_id = args.session_id or f"latency-probe-{int(time.time())}"
-    runner = DirectCochlRunner(audio_path) if args.mode == "direct" else LocalApiRunner(audio_path, args.url, args.timeout)
+    runner = (
+        DirectCochlRunner(audio_path, args.timeout)
+        if args.mode == "direct"
+        else LocalApiRunner(audio_path, args.url, args.timeout)
+    )
 
     print(
         "Starting probe: "
@@ -234,8 +242,21 @@ class ProbeRunner:
 
 
 class DirectCochlRunner(ProbeRunner):
-    def __init__(self, audio_path: Path):
+    def __init__(self, audio_path: Path, timeout: float):
         self.audio_path = audio_path
+        self.timeout = timeout
+        configured_socket_timeout = float(
+            os.getenv("COCHL_SOCKET_TIMEOUT_SEC", "30")
+        )
+        if (
+            not math.isfinite(configured_socket_timeout)
+            or configured_socket_timeout <= 0
+        ):
+            raise SystemExit("COCHL_SOCKET_TIMEOUT_SEC must be finite and positive.")
+        self.socket_timeout = min(
+            timeout,
+            configured_socket_timeout,
+        )
         self.project_key = os.getenv("COCHL_PROJECT_KEY", "")
         if not self.project_key:
             raise SystemExit("COCHL_PROJECT_KEY is required for --mode direct.")
@@ -266,6 +287,11 @@ class DirectCochlRunner(ProbeRunner):
         row.schedule_lag_ms = round_ms((request_start_wall - scheduled_wall) * 1000)
         try:
             from cochl.sense import IntegratedApi, IntegratedApiOptions
+            from backend.app.cochl_provider import (
+                _get_completed_result_with_socket_timeout,
+                _remaining_socket_timeout,
+                _submit_with_socket_timeout,
+            )
 
             api = IntegratedApi(project_key=self.project_key)
             options = IntegratedApiOptions(
@@ -273,22 +299,30 @@ class DirectCochlRunner(ProbeRunner):
                 speech_analysis=False,
                 audio_insights=False,
             )
-            options.caption = False
             options.speaker_diarization = False
             options.speaker_profile = False
+            deadline_at = time.monotonic() + self.timeout
 
             submit_started = time.perf_counter()
-            submitted = api.analyze_file(str(self.audio_path), options)
+            submitted = _submit_with_socket_timeout(
+                api,
+                self.audio_path,
+                options,
+                _remaining_socket_timeout(deadline_at, self.socket_timeout),
+            )
             row.submit_ms = round_ms((time.perf_counter() - submit_started) * 1000)
 
             job_id = extract_job_id(submitted)
-            if job_id:
-                wait_started = time.perf_counter()
-                result = api.get_completed_result(job_id)
-                row.result_wait_ms = round_ms((time.perf_counter() - wait_started) * 1000)
-            else:
-                result = submitted
-                row.result_wait_ms = 0
+            if not job_id:
+                raise RuntimeError("Cochl submission did not return a job id.")
+            wait_started = time.perf_counter()
+            result = _get_completed_result_with_socket_timeout(
+                api,
+                job_id,
+                _remaining_socket_timeout(deadline_at, self.socket_timeout),
+                deadline_at=deadline_at,
+            )
+            row.result_wait_ms = round_ms((time.perf_counter() - wait_started) * 1000)
 
             response_wall = time.time()
             row.response_received_at_iso = iso_from_epoch(response_wall)
@@ -455,11 +489,23 @@ def extract_job_id(response: dict[str, Any]) -> str:
 
 def labels_from_raw_result(raw_result: dict[str, Any]) -> list[str]:
     service = raw_result.get("sound_event_detection")
+    if service is None:
+        service = raw_result.get("sense")
     if not isinstance(service, dict):
-        return []
-    chunks = service.get("results") or service.get("events") or []
+        raise ValueError("Cochl response is missing sound-event results.")
+    if service.get("error") or str(service.get("status", "")).lower() in {
+        "error",
+        "fail",
+        "failed",
+        "failure",
+    }:
+        detail = service.get("error") or service.get("status")
+        raise ValueError(f"Cochl sound-event analysis failed: {detail}")
+    chunks = service.get("results")
+    if chunks is None:
+        chunks = service.get("events")
     if not isinstance(chunks, list):
-        chunks = [chunks]
+        raise ValueError("Cochl sound-event results are invalid.")
 
     labels: list[str] = []
     for chunk in chunks:
@@ -473,7 +519,11 @@ def labels_from_raw_result(raw_result: dict[str, Any]) -> list[str]:
                 continue
             label = item.get("class") or item.get("label") or item.get("name")
             if label:
-                confidence = item.get("confidence") or item.get("score")
+                confidence = (
+                    item.get("confidence")
+                    if item.get("confidence") is not None
+                    else item.get("score")
+                )
                 labels.append(label_with_confidence(str(label), confidence))
     return labels
 

@@ -1,6 +1,8 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
+#import <errno.h>
 #import <signal.h>
+#import <unistd.h>
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler>
 @property(nonatomic, strong) NSWindow *window;
@@ -13,6 +15,7 @@
 @property(nonatomic, copy) NSString *serverHost;
 @property(nonatomic, assign) NSInteger serverPort;
 @property(nonatomic, assign) BOOL isQuitting;
+@property(nonatomic, assign) BOOL serverReportedError;
 @property(nonatomic, assign) BOOL compactWindow;
 @property(nonatomic, assign) NSRect expandedWindowFrame;
 @property(nonatomic, assign) NSSize expandedWindowMinSize;
@@ -249,7 +252,7 @@
     readHandle.readabilityHandler = nil;
     dispatch_async(dispatch_get_main_queue(), ^{
       AppDelegate *strongSelf = weakSelf;
-      if (!strongSelf || strongSelf.isQuitting) {
+      if (!strongSelf || strongSelf.isQuitting || strongSelf.serverReportedError) {
         return;
       }
       [strongSelf showStatus:[NSString stringWithFormat:@"Cochl.Sense Cloud Live Demo 서버가 종료되었습니다: %d", finishedTask.terminationStatus]];
@@ -290,6 +293,7 @@
       [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
     }
   } else if ([line hasPrefix:@"Cochl.Sense Cloud Live Demo error:"]) {
+    self.serverReportedError = YES;
     [self showStatus:line];
   }
 }
@@ -300,19 +304,47 @@
   self.statusLabel.stringValue = message ?: @"";
 }
 
+- (BOOL)isProcessGroupAlive:(pid_t)pid {
+  if (pid <= 1) {
+    return NO;
+  }
+  if (kill(-pid, 0) == 0) {
+    return YES;
+  }
+  return errno == EPERM;
+}
+
 - (void)stopServer {
   NSTask *task = self.serverTask;
   if (!task || !task.isRunning) {
     return;
   }
 
-  [task terminate];
   pid_t pid = task.processIdentifier;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-    if (task.isRunning) {
-      kill(pid, SIGKILL);
-    }
-  });
+  if (pid <= 1) {
+    [task terminate];
+  } else if (kill(-pid, SIGTERM) != 0) {
+    // The child may not have completed setpgid() yet. Signalling its PID still
+    // prevents a close-during-launch race from leaving the runner alive.
+    [task terminate];
+  }
+
+  // Uvicorn has a five-second graceful-shutdown deadline. Give it two extra
+  // seconds, then kill any remaining descendants and always reap NSTask.
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:7.0];
+  while ((task.isRunning || [self isProcessGroupAlive:pid]) &&
+         deadline.timeIntervalSinceNow > 0) {
+    [[NSRunLoop currentRunLoop]
+      runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+  }
+  if ([self isProcessGroupAlive:pid]) {
+    kill(-pid, SIGKILL);
+  }
+  if (task.isRunning) {
+    kill(pid, SIGKILL);
+  }
+  [task waitUntilExit];
+  self.serverTask = nil;
 }
 
 @end

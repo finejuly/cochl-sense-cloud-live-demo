@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import wave
 from bisect import insort
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 
 from backend.app.config import Settings
@@ -45,6 +47,27 @@ CHUNK_DISCARDED_LATE = "discarded_late"
 DEFAULT_REORDER_HOLD_BACK_SEC = 6.0
 DEFAULT_STALE_SESSION_SEC = 600.0
 _TIME_EPSILON_SEC = 1e-3
+STALE_UPLOAD_MARKER_FILENAME = ".gcs-upload.stale.json"
+CLOSED_SESSION_MARKER_FILENAME = ".session-closed.json"
+_SEGMENT_DELETE_TOMBSTONE_SUFFIX = ".deleted"
+_segment_file_lock = Lock()
+
+_PRIVACY_TOKEN_ALIASES: dict[str, frozenset[str]] = {
+    "speech": frozenset({"speech", "speeches"}),
+    "whisper": frozenset(
+        {"whisper", "whispers", "whispered", "whispering", "whisperer"}
+    ),
+    "sing": frozenset({"sing", "sings", "sang", "sung", "singing", "singer"}),
+    "conversation": frozenset(
+        {"conversation", "conversations", "conversational"}
+    ),
+    "narration": frozenset(
+        {"narration", "narrations", "narrating", "narrator", "narrators"}
+    ),
+    "talk": frozenset(
+        {"talk", "talks", "talked", "talking", "talker", "talkers"}
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -76,8 +99,36 @@ def policy_from_settings(settings: Settings) -> CollectionPolicy:
 
 
 def is_privacy_sensitive_label(label: str, exclude_keywords: Sequence[str]) -> bool:
-    lowered = label.lower()
-    return any(keyword in lowered for keyword in exclude_keywords)
+    """Match privacy labels on taxonomy tokens, never arbitrary substrings.
+
+    Cochl labels commonly use underscores (for example ``Male_speech``), while
+    a few speech categories are inflected words (``Whispering``/``Singing``).
+    Token matching plus a deliberately small alias table keeps those categories
+    private without treating unrelated labels such as ``Reversing_beep`` as
+    singing merely because their spelling contains ``sing``.
+    """
+    label_tokens = tuple(re.findall(r"[a-z0-9]+", label.casefold()))
+    if not label_tokens:
+        return False
+
+    for raw_keyword in exclude_keywords:
+        keyword_tokens = tuple(re.findall(r"[a-z0-9]+", raw_keyword.casefold()))
+        if not keyword_tokens:
+            continue
+        if len(keyword_tokens) == 1:
+            variants = _PRIVACY_TOKEN_ALIASES.get(
+                keyword_tokens[0], frozenset(keyword_tokens)
+            )
+            if any(token in variants for token in label_tokens):
+                return True
+            continue
+        width = len(keyword_tokens)
+        if any(
+            label_tokens[index : index + width] == keyword_tokens
+            for index in range(len(label_tokens) - width + 1)
+        ):
+            return True
+    return False
 
 
 def classify_chunk_events(
@@ -137,6 +188,7 @@ class SegmentCollector:
         self._lock = Lock()
         self._pending: list[_ChunkEntry] = []
         self._max_window_end_seen = 0.0
+        self._processed_frontier: tuple[float, int] | None = None
         self._segment_chunks: list[_ChunkEntry] = []
         self._context_buffer: list[_ChunkEntry] = []
         self._segment_index = 0
@@ -148,6 +200,7 @@ class SegmentCollector:
         self._discarded_speech_count = 0
         self._source_dirs: set[Path] = set()
         self._ended = False
+        self._ended_summary: LiveSessionEndResponse | None = None
 
     def add_chunk(
         self,
@@ -172,10 +225,25 @@ class SegmentCollector:
             if self._ended:
                 # Late chunk after the session was finalized: apply the
                 # decision standalone so the file never lingers unbounded.
-                self._delete_chunk_file(entry)
+                _discard_late_chunk(entry.wav_path)
                 return CHUNK_DISCARDED_LATE
             self.last_activity_monotonic = monotonic()
             self._source_dirs.add(wav_path.parent)
+            entry_order = (entry.window_start_sec, entry.sequence_id)
+            if (
+                self._processed_frontier is not None
+                and entry_order <= self._processed_frontier
+            ):
+                logger.warning(
+                    "Discarding late chunk %s for session %s: order %s is not "
+                    "after processed frontier %s.",
+                    wav_path,
+                    self.session_id,
+                    entry_order,
+                    self._processed_frontier,
+                )
+                _discard_late_chunk(entry.wav_path)
+                return CHUNK_DISCARDED_LATE
             insort(self._pending, entry)
             self._max_window_end_seen = max(self._max_window_end_seen, window_end_sec)
             watermark = self._max_window_end_seen - self.policy.reorder_hold_back_sec
@@ -185,14 +253,21 @@ class SegmentCollector:
 
     def end_session(self) -> LiveSessionEndResponse:
         with self._lock:
+            if self._ended_summary is not None:
+                return self._ended_summary
             self._ended = True
             while self._pending:
                 self._process_entry(self._pending.pop(0))
             self._finalize_current_segment("session_end")
             self._flush_context_buffer()
             summary = self._build_summary(ended=True)
-            self._write_session_summary(summary)
+            # The client must not be told that a session is complete until the
+            # terminal state is durably visible to a restarted process.  Live
+            # progress snapshots are best-effort, but the final snapshot is a
+            # commit point and therefore propagates write failures.
+            self._write_session_summary(summary, required=True)
             self._cleanup_source_dirs()
+            self._ended_summary = summary
         return summary
 
     def _build_summary(self, *, ended: bool) -> LiveSessionEndResponse:
@@ -214,6 +289,22 @@ class SegmentCollector:
         )
 
     def _process_entry(self, entry: _ChunkEntry) -> None:
+        entry_order = (entry.window_start_sec, entry.sequence_id)
+        if (
+            self._processed_frontier is not None
+            and entry_order <= self._processed_frontier
+        ):
+            logger.error(
+                "Discarding internally out-of-order chunk %s for session %s: "
+                "order %s is not after processed frontier %s.",
+                entry.wav_path,
+                self.session_id,
+                entry_order,
+                self._processed_frontier,
+            )
+            self._delete_chunk_file(entry)
+            return
+        self._processed_frontier = entry_order
         if entry.decision == CHUNK_DISCARDED_SPEECH:
             self._discarded_speech_count += 1
             self._delete_chunk_file(entry)
@@ -598,8 +689,15 @@ class SegmentCollector:
             },
         }
 
-    def _write_session_summary(self, summary: LiveSessionEndResponse) -> None:
+    def _write_session_summary(
+        self,
+        summary: LiveSessionEndResponse,
+        *,
+        required: bool = False,
+    ) -> None:
         if summary.candidate_segment_count == 0 and not summary.segments:
+            if required:
+                self._write_closed_session_marker(summary)
             return
         temporary = self.output_dir / ".session.json.tmp"
         destination = self.output_dir / "session.json"
@@ -623,6 +721,24 @@ class SegmentCollector:
             logger.exception(
                 "Failed to write session summary for session %s.", self.session_id
             )
+            if required:
+                raise
+
+    def _write_closed_session_marker(self, summary: LiveSessionEndResponse) -> None:
+        """Persist an empty active session without exposing it as collected data."""
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.output_dir / CLOSED_SESSION_MARKER_FILENAME
+        temporary = self.output_dir / f"{CLOSED_SESSION_MARKER_FILENAME}.tmp"
+        try:
+            temporary.write_text(
+                json.dumps(summary.model_dump(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(destination)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
 
     def _observed_events(
         self,
@@ -836,11 +952,19 @@ class LiveCollectionManager:
     that would strand files in `recordings/live/`.
     """
 
-    def __init__(self, stale_session_sec: float = DEFAULT_STALE_SESSION_SEC):
+    def __init__(
+        self,
+        stale_session_sec: float = DEFAULT_STALE_SESSION_SEC,
+        collected_root: Path | None = None,
+    ):
         self.stale_session_sec = stale_session_sec
+        self.collected_root = collected_root
         self._lock = Lock()
         self._collectors: dict[str, SegmentCollector] = {}
         self._ended_sessions: dict[str, float] = {}
+        self._ended_summaries: dict[str, LiveSessionEndResponse] = {}
+        self._ending_sessions: dict[str, Event] = {}
+        self._accepting_chunks = True
 
     def add_chunk(
         self,
@@ -858,11 +982,27 @@ class LiveCollectionManager:
     ) -> str:
         with self._lock:
             self._prune_tombstones()
-            if session_id in self._ended_sessions:
+            if not self._accepting_chunks or session_id in self._ended_sessions:
                 _discard_late_chunk(wav_path)
                 return CHUNK_DISCARDED_LATE
             collector = self._collectors.get(session_id)
             if collector is None:
+                persisted_summary = _load_live_session_end_response(output_dir)
+                if persisted_summary is not None or _has_persisted_session_state(
+                    output_dir
+                ):
+                    # A restarted process (or an expired in-memory tombstone)
+                    # must never reuse a durable session id. Starting at
+                    # segment index 1 in an existing directory could overwrite
+                    # audio and replace its aggregate summary.
+                    self._ended_sessions[session_id] = monotonic()
+                    if (
+                        persisted_summary is not None
+                        and persisted_summary.ended_at is not None
+                    ):
+                        self._ended_summaries[session_id] = persisted_summary
+                    _discard_late_chunk(wav_path)
+                    return CHUNK_DISCARDED_LATE
                 collector = SegmentCollector(
                     session_id,
                     output_dir,
@@ -873,9 +1013,9 @@ class LiveCollectionManager:
                 self._collectors[session_id] = collector
             elif collector.session_name is None and session_name:
                 collector.session_name = session_name
-            stale = self._pop_stale_collectors(exclude=session_id)
-        for stale_collector in stale:
-            stale_collector.end_session()
+            stale_session_ids = self._stale_session_ids(exclude=session_id)
+        for stale_session_id in stale_session_ids:
+            self.end_session(stale_session_id)
         return collector.add_chunk(
             sequence_id=sequence_id,
             window_start_sec=window_start_sec,
@@ -888,37 +1028,127 @@ class LiveCollectionManager:
         self,
         session_id: str,
         session_name: str | None = None,
+        output_dir: Path | None = None,
     ) -> LiveSessionEndResponse:
-        with self._lock:
-            self._prune_tombstones()
-            self._ended_sessions[session_id] = monotonic()
-            collector = self._collectors.pop(session_id, None)
-        if collector is None:
-            return LiveSessionEndResponse(
-                session_id=session_id,
-                session_name=session_name,
-                segment_count=0,
-                total_collected_duration_sec=0.0,
-                kept_chunk_count=0,
-                discarded_silent_chunk_count=0,
-                discarded_speech_chunk_count=0,
-                segments=[],
-            )
-        if collector.session_name is None and session_name:
-            collector.session_name = session_name
-        return collector.end_session()
+        while True:
+            with self._lock:
+                self._prune_tombstones()
+                cached = self._ended_summaries.get(session_id)
+                if cached is not None:
+                    return cached
+                ending = self._ending_sessions.get(session_id)
+                if ending is None:
+                    ending = Event()
+                    self._ending_sessions[session_id] = ending
+                    self._ended_sessions[session_id] = monotonic()
+                    collector = self._collectors.pop(session_id, None)
+                    break
+            # A concurrent caller owns finalization. Waiting here ensures both
+            # callers observe the same persisted/cached response.
+            ending.wait()
 
-    def _pop_stale_collectors(self, exclude: str) -> list[SegmentCollector]:
+        summary: LiveSessionEndResponse | None = None
+        try:
+            if collector is not None:
+                if collector.session_name is None and session_name:
+                    collector.session_name = session_name
+                summary = collector.end_session()
+            else:
+                session_dir = self._session_dir(session_id, output_dir)
+                if session_dir is not None:
+                    summary = _load_live_session_end_response(session_dir)
+                    if summary is not None and summary.ended_at is None:
+                        summary = _finalize_recovered_session(
+                            session_dir,
+                            summary,
+                            session_name=session_name,
+                        )
+                if summary is None:
+                    summary = _empty_session_summary(session_id, session_name)
+            return summary
+        finally:
+            with self._lock:
+                if summary is not None:
+                    self._ended_summaries[session_id] = summary
+                elif collector is not None:
+                    # Finalization can fail at its durable commit point. Keep
+                    # the collector available so this or a concurrent caller
+                    # can retry instead of receiving a false empty summary.
+                    self._collectors.setdefault(session_id, collector)
+                completed = self._ending_sessions.pop(session_id, None)
+                if completed is not None:
+                    completed.set()
+
+    def end_all_sessions(self) -> list[LiveSessionEndResponse]:
+        """Stop accepting chunks and idempotently finalize every live collector."""
+        with self._lock:
+            self._accepting_chunks = False
+            session_ids = sorted(
+                set(self._collectors).union(self._ending_sessions)
+            )
+        summaries: list[LiveSessionEndResponse] = []
+        first_error: Exception | None = None
+        for session_id in session_ids:
+            try:
+                summaries.append(self.end_session(session_id))
+            except Exception as exc:
+                # A broken session must not prevent every other session from
+                # reaching its own durable terminal state during shutdown.
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+        return summaries
+
+    def recover_incomplete_sessions(
+        self,
+        collected_root: Path | None = None,
+    ) -> list[LiveSessionEndResponse]:
+        """Close persisted sessions left open by a previous process.
+
+        Segment files and aggregate counters are rebuilt from disk. The method
+        does not guess at orphaned raw live chunks; callers may clean that
+        staging area separately after this durable summary recovery succeeds.
+        """
+        root = collected_root or self.collected_root
+        if root is None or not root.is_dir():
+            return []
+
+        recovered: list[LiveSessionEndResponse] = []
+        for session_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            summary = _load_live_session_end_response(session_dir)
+            if summary is None:
+                continue
+            if summary.ended_at is None:
+                summary = _finalize_recovered_session(session_dir, summary)
+                recovered.append(summary)
+            with self._lock:
+                self._ended_sessions[summary.session_id] = monotonic()
+                self._ended_summaries[summary.session_id] = summary
+        return recovered
+
+    def _session_dir(
+        self,
+        session_id: str,
+        output_dir: Path | None,
+    ) -> Path | None:
+        if output_dir is not None:
+            return output_dir if output_dir.is_dir() else None
+        if self.collected_root is None:
+            return None
+        return safe_collected_session_dir(self.collected_root, session_id)
+
+    def _stale_session_ids(
+        self,
+        exclude: str,
+    ) -> list[str]:
         now = monotonic()
-        stale_ids = [
+        return [
             session_id
             for session_id, collector in self._collectors.items()
             if session_id != exclude
             and now - collector.last_activity_monotonic > self.stale_session_sec
         ]
-        for session_id in stale_ids:
-            self._ended_sessions[session_id] = now
-        return [self._collectors.pop(session_id) for session_id in stale_ids]
 
     def _prune_tombstones(self) -> None:
         now = monotonic()
@@ -929,6 +1159,7 @@ class LiveCollectionManager:
         ]
         for session_id in expired:
             del self._ended_sessions[session_id]
+            self._ended_summaries.pop(session_id, None)
 
 
 def _discard_late_chunk(wav_path: Path) -> None:
@@ -938,6 +1169,15 @@ def _discard_late_chunk(wav_path: Path) -> None:
     except OSError:
         # Parent not empty or already gone — nothing else to clean.
         pass
+
+
+def _has_persisted_session_state(output_dir: Path) -> bool:
+    if not output_dir.is_dir():
+        return False
+    # A decisions log or interrupted atomic-write temp is still evidence that
+    # this id has owned durable state. Fail closed instead of appending a new
+    # segment index sequence into any non-empty recovered directory.
+    return any(output_dir.iterdir())
 
 
 def safe_collected_session_dir(collected_root: Path, session_id: str) -> Path | None:
@@ -970,42 +1210,29 @@ def _load_collected_session(session_dir: Path) -> CollectedSessionInfo | None:
             loaded = json.loads(session_json.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 session_payload = loaded
+            else:
+                logger.warning("Ignoring non-object session summary %s.", session_json)
         except (OSError, json.JSONDecodeError):
             logger.warning("Skipping unreadable session summary %s.", session_json)
 
     segments: list[CollectedSegmentSummary] = []
     for metadata_path in sorted_segment_metadata_paths(session_dir):
         try:
-            data = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.warning("Skipping unreadable segment metadata %s.", metadata_path)
-            continue
-        audio_path = resolve_segment_audio(session_dir, metadata_path.stem)
-        if audio_path is None:
-            continue
-        events = data.get("events") or []
-        curation = data.get("curation") or {}
-        segments.append(
-            CollectedSegmentSummary(
-                segment_index=int(data.get("segment_index") or len(segments) + 1),
-                start_sec=float(data.get("start_sec") or 0.0),
-                end_sec=float(data.get("end_sec") or 0.0),
-                duration_sec=float(data.get("duration_sec") or 0.0),
-                event_count=len(events),
-                labels=sorted(
-                    {
-                        str(event.get("label"))
-                        for event in events
-                        if isinstance(event, dict) and event.get("label")
-                    }
-                ),
-                audio_filename=audio_path.name,
-                metadata_filename=metadata_path.name,
-                primary_label=curation.get("primary_label"),
-                quota_label=curation.get("quota_label"),
-                selection_reason=curation.get("selection_reason") or "legacy",
+            segment = _load_collected_segment(
+                session_dir,
+                metadata_path,
+                fallback_index=len(segments) + 1,
             )
-        )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Skipping malformed segment metadata %s: %s",
+                metadata_path,
+                exc,
+            )
+            continue
+        if segment is not None:
+            segments.append(segment)
+
     if not segments and not session_payload:
         return None
 
@@ -1026,41 +1253,351 @@ def _load_collected_session(session_dir: Path) -> CollectedSessionInfo | None:
     gcs_upload = _load_gcs_upload_status(session_dir)
     return CollectedSessionInfo(
         session_id=session_dir.name,
-        session_name=session_payload.get("session_name"),
-        started_at=session_payload.get("started_at"),
-        ended_at=session_payload.get("ended_at"),
+        session_name=_optional_text(session_payload.get("session_name")),
+        started_at=_optional_text(session_payload.get("started_at")),
+        ended_at=_optional_text(session_payload.get("ended_at")),
         segment_count=len(segments),
         total_collected_duration_sec=round(
             sum(segment.duration_sec for segment in segments), 3
         ),
         segments=segments,
         gcs_upload=gcs_upload,
-        candidate_segment_count=int(
-            session_payload.get("candidate_segment_count") or 0
+        candidate_segment_count=_payload_nonnegative_int(
+            session_payload, "candidate_segment_count"
         ),
-        policy_selected_segment_count=int(
-            session_payload.get("policy_selected_segment_count") or 0
+        policy_selected_segment_count=_payload_nonnegative_int(
+            session_payload, "policy_selected_segment_count"
         ),
-        policy_selected_duration_sec=float(
-            session_payload.get("policy_selected_duration_sec") or 0.0
+        policy_selected_duration_sec=_payload_nonnegative_float(
+            session_payload, "policy_selected_duration_sec"
         ),
-        policy_selected_audio_bytes=int(
-            session_payload.get("policy_selected_audio_bytes") or 0
+        policy_selected_audio_bytes=_payload_nonnegative_int(
+            session_payload, "policy_selected_audio_bytes"
         ),
-        rejected_repetitive_count=int(
-            session_payload.get("rejected_repetitive_count") or 0
+        rejected_repetitive_count=_payload_nonnegative_int(
+            session_payload, "rejected_repetitive_count"
         ),
-        rejected_class_balance_count=int(
-            session_payload.get("rejected_class_balance_count") or 0
+        rejected_class_balance_count=_payload_nonnegative_int(
+            session_payload, "rejected_class_balance_count"
         ),
-        rejected_session_budget_count=int(
-            session_payload.get("rejected_session_budget_count") or 0
+        rejected_session_budget_count=_payload_nonnegative_int(
+            session_payload, "rejected_session_budget_count"
         ),
-        invalid_audio_count=int(session_payload.get("invalid_audio_count") or 0),
-        write_error_count=int(session_payload.get("write_error_count") or 0),
+        invalid_audio_count=_payload_nonnegative_int(
+            session_payload, "invalid_audio_count"
+        ),
+        write_error_count=_payload_nonnegative_int(
+            session_payload, "write_error_count"
+        ),
         selected_label_segment_counts=selected_label_segment_counts,
         selected_quota_duration_sec=selected_quota_duration_sec,
-        policy_version=session_payload.get("policy_version"),
+        policy_version=_payload_optional_positive_int(
+            session_payload, "policy_version"
+        ),
+    )
+
+
+def _load_collected_segment(
+    session_dir: Path,
+    metadata_path: Path,
+    *,
+    fallback_index: int,
+) -> CollectedSegmentSummary | None:
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("metadata must be a JSON object")
+    audio_path = resolve_segment_audio(session_dir, metadata_path.stem)
+    if audio_path is None:
+        return None
+
+    events = data.get("events") or []
+    if not isinstance(events, list) or any(
+        not isinstance(event, dict) for event in events
+    ):
+        raise ValueError("events must be a list of JSON objects")
+    curation = data.get("curation") or {}
+    if not isinstance(curation, dict):
+        raise ValueError("curation must be a JSON object")
+
+    labels: set[str] = set()
+    for event in events:
+        raw_label = event.get("label")
+        if raw_label is None or raw_label == "":
+            continue
+        if not isinstance(raw_label, str):
+            raise ValueError("event labels must be strings")
+        labels.add(raw_label)
+
+    segment_index = _positive_int(data.get("segment_index"), fallback_index)
+    start_sec = _finite_float(data.get("start_sec"), 0.0)
+    end_sec = _finite_float(data.get("end_sec"), 0.0)
+    duration_sec = _finite_float(data.get("duration_sec"), 0.0)
+    if start_sec < 0 or end_sec < start_sec or duration_sec < 0:
+        raise ValueError("segment times must be non-negative and ordered")
+
+    return CollectedSegmentSummary(
+        segment_index=segment_index,
+        start_sec=start_sec,
+        end_sec=end_sec,
+        duration_sec=duration_sec,
+        event_count=len(events),
+        labels=sorted(labels),
+        audio_filename=audio_path.name,
+        metadata_filename=metadata_path.name,
+        primary_label=_optional_text(curation.get("primary_label")),
+        quota_label=_optional_text(curation.get("quota_label")),
+        selection_reason=(
+            _optional_text(curation.get("selection_reason")) or "legacy"
+        ),
+    )
+
+
+def _optional_text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _finite_float(value: object, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a numeric value")
+    converted = float(value)
+    if not isfinite(converted):
+        raise ValueError("numeric value must be finite")
+    return converted
+
+
+def _positive_int(value: object, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError("boolean is not an integer value")
+    converted = int(value)
+    if converted <= 0:
+        raise ValueError("integer value must be positive")
+    return converted
+
+
+def _payload_nonnegative_int(payload: dict, key: str) -> int:
+    try:
+        value = payload.get(key)
+        if value is None:
+            return 0
+        if isinstance(value, bool):
+            raise ValueError
+        converted = int(value)
+        if converted < 0:
+            raise ValueError
+        return converted
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s in session summary.", key)
+        return 0
+
+
+def _payload_nonnegative_float(payload: dict, key: str) -> float:
+    try:
+        converted = _finite_float(payload.get(key), 0.0)
+        if converted < 0:
+            raise ValueError
+        return converted
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s in session summary.", key)
+        return 0.0
+
+
+def _payload_optional_positive_int(payload: dict, key: str) -> int | None:
+    if payload.get(key) is None:
+        return None
+    try:
+        return _positive_int(payload[key], 1)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s in session summary.", key)
+        return None
+
+
+def _load_live_session_end_response(
+    session_dir: Path,
+) -> LiveSessionEndResponse | None:
+    session_json = session_dir / "session.json"
+    if not session_json.is_file():
+        closed_marker = session_dir / CLOSED_SESSION_MARKER_FILENAME
+        if closed_marker.is_file():
+            try:
+                payload = json.loads(closed_marker.read_text(encoding="utf-8"))
+                summary = LiveSessionEndResponse.model_validate(payload)
+            except (OSError, json.JSONDecodeError, ValueError):
+                logger.warning("Cannot recover empty-session marker %s.", closed_marker)
+            else:
+                if summary.session_id == session_dir.name and summary.ended_at is not None:
+                    return summary
+                logger.warning("Ignoring invalid empty-session marker %s.", closed_marker)
+        return _synthesize_session_summary_from_segments(session_dir)
+    try:
+        payload = json.loads(session_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Cannot recover unreadable session summary %s.", session_json)
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("Cannot recover non-object session summary %s.", session_json)
+        return None
+
+    info = _load_collected_session(session_dir)
+    if info is None:
+        return None
+    return LiveSessionEndResponse(
+        session_id=info.session_id,
+        session_name=info.session_name,
+        started_at=info.started_at,
+        ended_at=info.ended_at,
+        segment_count=info.segment_count,
+        total_collected_duration_sec=info.total_collected_duration_sec,
+        kept_chunk_count=_payload_nonnegative_int(payload, "kept_chunk_count"),
+        discarded_silent_chunk_count=_payload_nonnegative_int(
+            payload, "discarded_silent_chunk_count"
+        ),
+        discarded_speech_chunk_count=_payload_nonnegative_int(
+            payload, "discarded_speech_chunk_count"
+        ),
+        segments=info.segments,
+        candidate_segment_count=info.candidate_segment_count,
+        policy_selected_segment_count=info.policy_selected_segment_count,
+        policy_selected_duration_sec=info.policy_selected_duration_sec,
+        policy_selected_audio_bytes=info.policy_selected_audio_bytes,
+        rejected_repetitive_count=info.rejected_repetitive_count,
+        rejected_class_balance_count=info.rejected_class_balance_count,
+        rejected_session_budget_count=info.rejected_session_budget_count,
+        invalid_audio_count=info.invalid_audio_count,
+        write_error_count=info.write_error_count,
+        selected_label_segment_counts=info.selected_label_segment_counts,
+        selected_quota_duration_sec=info.selected_quota_duration_sec,
+        policy_version=info.policy_version,
+    )
+
+
+def _synthesize_session_summary_from_segments(
+    session_dir: Path,
+) -> LiveSessionEndResponse | None:
+    """Rebuild the minimum open summary after a crash before session.json publish."""
+
+    info = _load_collected_session(session_dir)
+    if info is None or not info.segments:
+        return None
+
+    session_name: str | None = None
+    started_at: str | None = None
+    policy_version: int | None = info.policy_version
+    chunk_sequence_ids: set[int] = set()
+    for metadata_path in sorted_segment_metadata_paths(session_dir):
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if session_name is None:
+            session_name = _optional_text(payload.get("session_name"))
+        if started_at is None:
+            started_at = _optional_text(payload.get("session_started_at"))
+        raw_sequence_ids = payload.get("chunk_sequence_ids")
+        if isinstance(raw_sequence_ids, list):
+            for value in raw_sequence_ids:
+                if isinstance(value, bool):
+                    continue
+                try:
+                    sequence_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if sequence_id > 0:
+                    chunk_sequence_ids.add(sequence_id)
+        curation = payload.get("curation")
+        if policy_version is None and isinstance(curation, dict):
+            raw_policy_version = curation.get("policy_version")
+            if raw_policy_version is not None:
+                try:
+                    policy_version = _positive_int(raw_policy_version, 1)
+                except (TypeError, ValueError):
+                    pass
+
+    audio_bytes = 0
+    for segment in info.segments:
+        audio_path = session_dir / segment.audio_filename
+        try:
+            audio_bytes += audio_path.stat().st_size
+        except OSError:
+            # The segment loader already required audio. A concurrent loss is
+            # reflected by the startup cleanup/listing pass rather than guessed.
+            return None
+
+    return LiveSessionEndResponse(
+        session_id=session_dir.name,
+        session_name=session_name,
+        started_at=started_at,
+        ended_at=None,
+        segment_count=len(info.segments),
+        total_collected_duration_sec=info.total_collected_duration_sec,
+        kept_chunk_count=len(chunk_sequence_ids) or len(info.segments),
+        discarded_silent_chunk_count=0,
+        discarded_speech_chunk_count=0,
+        segments=info.segments,
+        candidate_segment_count=len(info.segments),
+        policy_selected_segment_count=len(info.segments),
+        policy_selected_duration_sec=info.total_collected_duration_sec,
+        policy_selected_audio_bytes=audio_bytes,
+        selected_label_segment_counts=info.selected_label_segment_counts,
+        selected_quota_duration_sec=info.selected_quota_duration_sec,
+        policy_version=policy_version,
+    )
+
+
+def _finalize_recovered_session(
+    session_dir: Path,
+    summary: LiveSessionEndResponse,
+    *,
+    session_name: str | None = None,
+) -> LiveSessionEndResponse:
+    if summary.ended_at is not None:
+        return summary
+    finalized = summary.model_copy(
+        update={
+            "session_name": summary.session_name or session_name,
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    session_json = session_dir / "session.json"
+    if session_json.is_file():
+        payload = json.loads(session_json.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Persisted session summary must be a JSON object.")
+    else:
+        payload = {"recovered_from_segment_metadata": True}
+    payload.update(finalized.model_dump(exclude={"segments"}))
+    payload["recovered_at"] = datetime.now(timezone.utc).isoformat()
+    temporary = session_dir / ".session.recovery.json.tmp"
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(session_json)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
+    return finalized
+
+
+def _empty_session_summary(
+    session_id: str,
+    session_name: str | None,
+) -> LiveSessionEndResponse:
+    return LiveSessionEndResponse(
+        session_id=session_id,
+        session_name=session_name,
+        segment_count=0,
+        total_collected_duration_sec=0.0,
+        kept_chunk_count=0,
+        discarded_silent_chunk_count=0,
+        discarded_speech_chunk_count=0,
+        segments=[],
     )
 
 
@@ -1080,8 +1617,37 @@ def delete_collected_session(collected_root: Path, session_id: str) -> bool:
     session_dir = safe_collected_session_dir(collected_root, session_id)
     if session_dir is None:
         return False
-    shutil.rmtree(session_dir, ignore_errors=True)
+    with _segment_file_lock:
+        # Re-resolve under the publish/delete lock so a concurrent conversion
+        # cannot recreate a file after this directory is removed.
+        session_dir = safe_collected_session_dir(collected_root, session_id)
+        if session_dir is None:
+            return False
+        try:
+            shutil.rmtree(session_dir)
+        except FileNotFoundError:
+            return False
     return True
+
+
+def publish_segment_conversion(wav_path: Path, temporary_mp3_path: Path) -> bool:
+    """Atomically publish a conversion only while its segment still exists.
+
+    The conversion itself may run without the lock. Callers must use this
+    helper for the final rename; it serializes that small commit with segment
+    and session deletion, and checks both semantic metadata and a deletion
+    tombstone before making the MP3 visible.
+    """
+    stem = wav_path.stem
+    session_dir = wav_path.parent
+    metadata_path = session_dir / f"{stem}.json"
+    tombstone = _segment_delete_tombstone(session_dir, stem)
+    destination = session_dir / f"{stem}.mp3"
+    with _segment_file_lock:
+        if tombstone.exists() or not metadata_path.is_file():
+            return False
+        temporary_mp3_path.replace(destination)
+        return True
 
 
 def delete_collected_segment(
@@ -1095,44 +1661,105 @@ def delete_collected_segment(
     stem = Path(filename).stem
     if not stem.startswith("segment-"):
         return False
-    deleted = False
-    for suffix in (".wav", ".mp3", ".json"):
-        target = session_dir / f"{stem}{suffix}"
-        if target.is_file():
-            target.unlink(missing_ok=True)
-            deleted = True
-    if deleted:
+    with _segment_file_lock:
+        session_dir = safe_collected_session_dir(collected_root, session_id)
+        if session_dir is None:
+            return False
+        targets = [
+            session_dir / f"{stem}{suffix}"
+            for suffix in (".wav", ".mp3", ".json")
+        ]
+        existing_targets = [target for target in targets if target.is_file()]
+        if not existing_targets:
+            return False
+
+        # The tombstone is committed before any source disappears. A conversion
+        # that finishes later must consult publish_segment_conversion and will
+        # therefore fail closed.
+        _segment_delete_tombstone(session_dir, stem).touch(exist_ok=True)
+        _invalidate_gcs_upload_marker(session_dir, deleted_segment=filename)
+        for target in existing_targets:
+            target.unlink()
+
         session_json = session_dir / "session.json"
         if not session_json.is_file():
             if not any(session_dir.glob("segment-*.json")):
-                shutil.rmtree(session_dir, ignore_errors=True)
+                shutil.rmtree(session_dir)
             return True
+
         session = _load_collected_session(session_dir)
-        if session is not None:
-            try:
-                payload = json.loads(session_json.read_text(encoding="utf-8"))
-                payload.update(
-                    {
-                        "segment_count": session.segment_count,
-                        "total_collected_duration_sec": (
-                            session.total_collected_duration_sec
-                        ),
-                        "selected_label_segment_counts": (
-                            session.selected_label_segment_counts
-                        ),
-                        "selected_quota_duration_sec": (
-                            session.selected_quota_duration_sec
-                        ),
-                    }
-                )
-                temporary = session_dir / ".session.json.tmp"
-                temporary.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                temporary.replace(session_json)
-            except (OSError, json.JSONDecodeError):
-                logger.exception(
-                    "Failed to update session summary after deleting %s.", filename
-                )
-    return deleted
+        if session is None:
+            raise ValueError(
+                f"Could not rebuild session summary after deleting {filename}."
+            )
+        payload = json.loads(session_json.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Session summary must be a JSON object.")
+        payload.update(
+            {
+                "segment_count": session.segment_count,
+                "total_collected_duration_sec": (
+                    session.total_collected_duration_sec
+                ),
+                "selected_label_segment_counts": (
+                    session.selected_label_segment_counts
+                ),
+                "selected_quota_duration_sec": (
+                    session.selected_quota_duration_sec
+                ),
+            }
+        )
+        temporary = session_dir / ".session.json.tmp"
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(session_json)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
+    return True
+
+
+def _segment_delete_tombstone(session_dir: Path, stem: str) -> Path:
+    return session_dir / f".{stem}{_SEGMENT_DELETE_TOMBSTONE_SUFFIX}"
+
+
+def _invalidate_gcs_upload_marker(
+    session_dir: Path,
+    *,
+    deleted_segment: str,
+) -> None:
+    marker = session_dir / UPLOAD_MARKER_FILENAME
+    if not marker.is_file():
+        return
+    stale_marker = session_dir / STALE_UPLOAD_MARKER_FILENAME
+    marker.replace(stale_marker)
+
+    # The rename above is the atomic invalidation. Enrichment is best-effort:
+    # even a malformed legacy marker remains inactive under the stale name.
+    temporary = session_dir / f"{STALE_UPLOAD_MARKER_FILENAME}.tmp"
+    try:
+        payload = json.loads(stale_marker.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return
+        payload.update(
+            {
+                "status": "stale",
+                "invalidated_at": datetime.now(timezone.utc).isoformat(),
+                "invalidated_reason": "local_segment_deleted",
+                "invalidated_segment_filename": deleted_segment,
+            }
+        )
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(stale_marker)
+    except (OSError, json.JSONDecodeError):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        logger.warning("Could not enrich stale GCS marker %s.", stale_marker)

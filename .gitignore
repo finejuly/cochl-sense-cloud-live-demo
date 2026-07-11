@@ -3,8 +3,7 @@
 .env.*
 !.env.example
 .build/
-CochlSenseCloudLiveDemo.app/
-SenseApp.app/
+*.app/
 
 __pycache__/
 *.py[cod]

@@ -44,6 +44,8 @@ def test_prepare_audio_keeps_supported_file(tmp_path):
 def test_prepare_audio_converts_unsupported_file(tmp_path, monkeypatch):
     source = tmp_path / "clip.webm"
     source.write_bytes(b"fake")
+    existing_wav = tmp_path / "clip.wav"
+    existing_wav.write_bytes(b"existing")
     converted_paths = []
 
     def fake_convert_to_wav(input_path, output_path):
@@ -55,9 +57,38 @@ def test_prepare_audio_converts_unsupported_file(tmp_path, monkeypatch):
     prepared = prepare_audio_for_cochl(source, "audio/webm", "clip.webm")
 
     assert prepared.path.suffix == ".wav"
+    assert prepared.path != existing_wav
+    assert prepared.path.name.startswith(".clip.webm.")
+    assert prepared.path.name.endswith(".cochl.wav")
     assert prepared.content_type == "audio/wav"
     assert prepared.path.read_bytes() == b"wav"
+    assert existing_wav.read_bytes() == b"existing"
     assert converted_paths == [(source, prepared.path)]
+
+
+def test_prepare_audio_removes_partial_conversion_on_failure(tmp_path, monkeypatch):
+    source = tmp_path / "clip.webm"
+    source.write_bytes(b"fake")
+    attempted_output = None
+
+    def failing_conversion(input_path, output_path):
+        nonlocal attempted_output
+        attempted_output = output_path
+        output_path.write_bytes(b"partial")
+        raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr("backend.app.audio.convert_to_wav", failing_conversion)
+
+    try:
+        prepare_audio_for_cochl(source, "audio/webm", source.name)
+    except RuntimeError as exc:
+        assert "conversion failed" in str(exc)
+    else:
+        raise AssertionError("Expected conversion failure")
+
+    assert attempted_output is not None
+    assert not attempted_output.exists()
+    assert source.read_bytes() == b"fake"
 
 
 def test_convert_to_mp3_uses_44100_hz_mono_128_kbps(tmp_path, monkeypatch):
@@ -77,6 +108,7 @@ def test_convert_to_mp3_uses_44100_hz_mono_128_kbps(tmp_path, monkeypatch):
         (
             [
                 "/usr/bin/ffmpeg",
+                "-nostdin",
                 "-y",
                 "-i",
                 str(source),
@@ -88,6 +120,6 @@ def test_convert_to_mp3_uses_44100_hz_mono_128_kbps(tmp_path, monkeypatch):
                 "128k",
                 str(output),
             ],
-            {"check": True, "capture_output": True, "text": True},
+            {"check": True, "capture_output": True, "text": True, "timeout": 120},
         )
     ]

@@ -14,6 +14,8 @@ export interface LiveSpectrogramFrame {
   magnitudes: number[];
 }
 
+export type LiveAudioContextState = AudioContextState | 'interrupted';
+
 export function appendCompactedSpectrogramFrame(
   frames: LiveSpectrogramFrame[],
   frame: LiveSpectrogramFrame,
@@ -38,7 +40,14 @@ export interface LiveAudioCaptureOptions {
   onSpectrogramFrame?: (frame: LiveSpectrogramFrame) => void;
   spectrogramFps?: number;
   spectrogramBins?: number;
+  onAudioTimeUpdate?: (elapsedSec: number) => void;
+  onStateChange?: (state: LiveAudioContextState) => void;
 }
+
+export type LiveAudioCaptureController = (() => void) & {
+  resume: () => Promise<void>;
+  state: () => LiveAudioContextState;
+};
 
 export class LiveWindowBuffer {
   private readonly sampleRate: number;
@@ -127,7 +136,7 @@ export async function createLiveAudioCapture(
   stream: MediaStream,
   onWindow: (window: LiveAudioWindow) => void,
   options: LiveAudioCaptureOptions = {},
-): Promise<() => void> {
+): Promise<LiveAudioCaptureController> {
   const AudioContextCtor = getAudioContextConstructor();
   if (!AudioContextCtor) {
     throw new Error('Web Audio API is not supported.');
@@ -140,6 +149,18 @@ export async function createLiveAudioCapture(
   if (requestedSampleRate !== null && context.sampleRate !== requestedSampleRate) {
     await context.close().catch(() => undefined);
     throw new Error(`${requestedSampleRate} Hz 오디오 처리를 지원하지 않는 환경입니다.`);
+  }
+
+  const initialState = context.state as LiveAudioContextState | undefined;
+  if (initialState && initialState !== 'running' && initialState !== 'closed') {
+    await context.resume().catch(async (error) => {
+      await context.close().catch(() => undefined);
+      throw error;
+    });
+  }
+  if (context.state && context.state !== 'running') {
+    await context.close().catch(() => undefined);
+    throw new Error(`오디오 처리를 시작하지 못했습니다 (${context.state}).`);
   }
   const source = context.createMediaStreamSource(stream);
   const analyser = context.createAnalyser();
@@ -159,6 +180,7 @@ export async function createLiveAudioCapture(
 
   const processSamples = (input: AudioSamples) => {
     totalCapturedSamples += input.length;
+    options.onAudioTimeUpdate?.(totalCapturedSamples / context.sampleRate);
     buffer.push(input.slice(0)).forEach(onWindow);
 
     if (options.onSpectrogramFrame && totalCapturedSamples >= nextSpectrogramSample) {
@@ -226,7 +248,18 @@ export async function createLiveAudioCapture(
   analyser.connect(captureNode);
   captureNode.connect(context.destination);
 
-  return () => {
+  const handleStateChange = () => options.onStateChange?.(
+    context.state as LiveAudioContextState,
+  );
+  context.addEventListener?.('statechange', handleStateChange);
+
+  let cleanedUp = false;
+  const cleanup = (() => {
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+    context.removeEventListener?.('statechange', handleStateChange);
     detachCapture();
     try {
       source.disconnect();
@@ -244,7 +277,26 @@ export async function createLiveAudioCapture(
       // Ignore cleanup errors from already-disconnected nodes.
     }
     void context.close().catch(() => undefined);
+  }) as LiveAudioCaptureController;
+  cleanup.resume = async () => {
+    if (cleanedUp) {
+      throw new Error('이미 종료된 오디오 캡처는 재개할 수 없습니다.');
+    }
+    if (context.state !== 'running') {
+      await context.resume();
+    }
+    if (context.state !== 'running') {
+      throw new Error(`오디오 처리를 재개하지 못했습니다 (${context.state}).`);
+    }
+    options.onStateChange?.(context.state as LiveAudioContextState);
   };
+  cleanup.state = () => context.state as LiveAudioContextState;
+  if ((context.state as string) === 'closed') {
+    cleanup();
+    throw new Error('오디오 처리 연결이 시작 중 종료되었습니다.');
+  }
+  options.onStateChange?.(context.state as LiveAudioContextState);
+  return cleanup;
 }
 
 const LIVE_CAPTURE_WORKLET_NAME = 'cochl-live-audio-capture';

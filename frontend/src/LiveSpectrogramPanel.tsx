@@ -1,4 +1,13 @@
-import { Fragment, type CSSProperties, type ChangeEvent, useEffect, useMemo, useRef } from 'react';
+import {
+  Fragment,
+  type CSSProperties,
+  type ChangeEvent,
+  type RefObject,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { Download, ExternalLink } from 'lucide-react';
 import type { LiveSpectrogramFrame } from './liveAudio';
 import {
@@ -17,7 +26,9 @@ import { formatTime } from './waveform';
 
 interface LiveSpectrogramPanelProps {
   frames: LiveSpectrogramFrame[];
+  framesRef?: RefObject<LiveSpectrogramFrame[]>;
   frameVersion: number;
+  active?: boolean;
   events: LiveTimelineEvent[];
   diagnostics: LiveDiagnostics;
   viewport: LiveTimelineViewport;
@@ -34,12 +45,14 @@ interface LiveSpectrogramPanelProps {
   onJumpToLatest: () => void;
 }
 
-const MARKER_LANE_HEIGHT = 28;
+const MARKER_LANE_HEIGHT = 34;
 const CHUNK_LANE_HEIGHT = 24;
 
 export function LiveSpectrogramPanel({
   frames,
+  framesRef,
   frameVersion,
+  active = false,
   events,
   diagnostics,
   viewport,
@@ -56,12 +69,16 @@ export function LiveSpectrogramPanel({
   onJumpToLatest,
 }: LiveSpectrogramPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const renderEvents = useMemo(() => renderLiveTimelineEvents(events, viewport), [events, viewport]);
   const renderChunks = useMemo(
     () => renderLiveChunkRecords(chunkRecords, viewport, chunkSnapshotMs),
     [chunkRecords, chunkSnapshotMs, viewport],
   );
   const history = useMemo(() => latestLiveTimelineEvents(events, historyLimit), [events, historyLimit]);
+  const selectedEvent = selectedEventId
+    ? events.find((event) => event.id === selectedEventId) ?? null
+    : null;
   const viewportDurationSec = Math.max(0.001, viewport.endSec - viewport.startSec);
   const laneCount = renderEvents.length
     ? Math.max(...renderEvents.map((event) => event.lane)) + 1
@@ -86,8 +103,22 @@ export function LiveSpectrogramPanel({
       return;
     }
 
-    drawSpectrogram(canvas, frames, viewport);
-  }, [frameVersion, frames, viewport]);
+    const drawCurrentFrames = () => {
+      drawSpectrogram(canvas, framesRef?.current ?? frames, viewport);
+    };
+    drawCurrentFrames();
+    if (!active) {
+      return;
+    }
+    const interval = window.setInterval(drawCurrentFrames, 1000 / 12);
+    return () => window.clearInterval(interval);
+  }, [active, frameVersion, frames, framesRef, viewport]);
+
+  useEffect(() => {
+    if (selectedEventId && !events.some((event) => event.id === selectedEventId)) {
+      setSelectedEventId(null);
+    }
+  }, [events, selectedEventId]);
 
   function handleSliderChange(event: ChangeEvent<HTMLInputElement>) {
     onViewportStartChange(Number(event.currentTarget.value));
@@ -112,9 +143,9 @@ export function LiveSpectrogramPanel({
         <canvas ref={canvasRef} className="live-spectrogram-canvas" aria-label="실시간 스펙트로그램" />
         <div className="live-marker-layer" style={{ height: markerLayerHeight }}>
           {renderEvents.map((event) => (
-            <span
+            <button
+              type="button"
               key={event.id}
-              role="img"
               className="live-marker"
               style={{
                 left: `${event.leftPercent}%`,
@@ -123,12 +154,21 @@ export function LiveSpectrogramPanel({
               }}
               title={markerDescription(event)}
               aria-label={markerDescription(event)}
+              aria-pressed={selectedEventId === event.id}
+              aria-describedby={selectedEventId === event.id ? 'live-marker-detail' : undefined}
+              onClick={() => setSelectedEventId((current) => current === event.id ? null : event.id)}
             >
               {eventLabel(event)}
-            </span>
+            </button>
           ))}
         </div>
       </div>
+
+      {selectedEvent && (
+        <p id="live-marker-detail" className="live-marker-detail">
+          {markerDescription(selectedEvent)}
+        </p>
+      )}
 
       {chunkLaneCount > 0 && (
         <div
@@ -262,28 +302,34 @@ function drawSpectrogram(
   const height = Math.max(140, Math.floor(rect.height || 170));
   const scale = window.devicePixelRatio || 1;
   const viewportDurationSec = Math.max(0.001, viewport.endSec - viewport.startSec);
+  const backingWidth = Math.round(width * scale);
+  const backingHeight = Math.round(height * scale);
 
-  canvas.width = width * scale;
-  canvas.height = height * scale;
+  // Assigning canvas dimensions clears and reallocates the backing store. The
+  // live loop runs 12 times per second, so only resize when layout or DPR did.
+  if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
+    canvas.width = backingWidth;
+    canvas.height = backingHeight;
+  }
   context.setTransform(scale, 0, 0, scale, 0, 0);
   context.clearRect(0, 0, width, height);
   context.fillStyle = '#101a22';
   context.fillRect(0, 0, width, height);
 
   framesInViewport(frames, viewport).forEach((frame) => {
-      const x = ((frame.timestampSec - viewport.startSec) / viewportDurationSec) * width;
-      const binHeight = height / Math.max(1, frame.magnitudes.length);
-      const columnWidth = Math.max(1, width / Math.max(1, viewportDurationSec * 12));
+    const x = ((frame.timestampSec - viewport.startSec) / viewportDurationSec) * width;
+    const binHeight = height / Math.max(1, frame.magnitudes.length);
+    const columnWidth = Math.max(1, width / Math.max(1, viewportDurationSec * 12));
 
-      frame.magnitudes.forEach((magnitude, index) => {
-        context.fillStyle = colorForMagnitude(magnitude);
-        context.fillRect(
-          x,
-          height - (index + 1) * binHeight,
-          columnWidth,
-          Math.max(1, binHeight),
-        );
-      });
+    frame.magnitudes.forEach((magnitude, index) => {
+      context.fillStyle = colorForMagnitude(magnitude);
+      context.fillRect(
+        x,
+        height - (index + 1) * binHeight,
+        columnWidth,
+        Math.max(1, binHeight),
+      );
+    });
   });
 }
 
