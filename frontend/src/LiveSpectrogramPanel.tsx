@@ -27,7 +27,7 @@ import {
   type LiveTimelineEvent,
   type LiveTimelineViewport,
 } from './liveTimeline';
-import { formatTime } from './waveform';
+import { formatTime } from './time';
 
 interface LiveSpectrogramPanelProps {
   frames: LiveSpectrogramFrame[];
