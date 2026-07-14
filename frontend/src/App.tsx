@@ -2,25 +2,23 @@ import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   AudioLines,
-  CheckCircle2,
   Database,
   Maximize2,
   Mic,
   Minimize2,
   Pause,
-  Play,
   RefreshCw,
   Square,
-  Trash2,
 } from 'lucide-react';
-import { analyzeLiveChunk, endLiveSession } from './api';
-import { getAudioContextConstructor } from './audioContext';
+import { analyzeLiveChunk, endLiveSession, fetchRuntimeConfig } from './api';
 import { CollectedSessionsPanel } from './CollectedSessionsPanel';
 import { LiveSpectrogramPanel } from './LiveSpectrogramPanel';
 import {
   createLiveAudioCapture,
   encodePcm16Wav,
   appendCompactedSpectrogramFrame,
+  type LiveAudioCaptureController,
+  type LiveAudioContextState,
   type LiveAudioWindow,
   type LiveSpectrogramFrame,
 } from './liveAudio';
@@ -49,16 +47,16 @@ import {
   type LiveChunkRecord,
 } from './liveChunkRecords';
 import type {
-  AnalysisResponse,
   LiveChunkCollectionStatus,
+  LiveCurationProgress,
   LiveSessionEndResponse,
+  RuntimeCapabilities,
   SoundEvent,
 } from './types';
-import { eventOverlayStyle, formatTime, peaksFromSamples } from './waveform';
+import { formatTime } from './time';
 import './App.css';
 
-type RecorderStatus = 'idle' | 'starting' | 'recording' | 'complete' | 'error';
-type SegmentPlaybackMode = 'loading' | 'buffer' | 'native';
+type RecorderStatus = 'idle' | 'starting' | 'recording' | 'finalizing' | 'complete' | 'error';
 type ExtendedMediaTrackConstraints = MediaTrackConstraints & {
   voiceIsolation?: ConstrainBoolean;
 };
@@ -81,16 +79,21 @@ const LIVE_MICROPHONE_CONSTRAINTS: MediaStreamConstraints = {
   audio: LIVE_MICROPHONE_AUDIO_CONSTRAINTS,
 };
 const LIVE_MAX_IN_FLIGHT = 10;
-const LIVE_CONFIDENCE_THRESHOLD = 0.5;
+const DEFAULT_LIVE_CONFIDENCE_THRESHOLD = 0.5;
 const LIVE_VIEWPORT_SEC = 20;
 const LIVE_SPECTROGRAM_FPS = 12;
 const LIVE_SPECTROGRAM_BINS = 64;
 const LIVE_HISTORY_LIMIT = 6;
 const LIVE_REQUEST_TIMEOUT_MS = 60_000;
+const LIVE_SESSION_END_TIMEOUT_MS = 30_000;
 const MAX_LIVE_SPECTROGRAM_FRAMES = 12_000;
 const LIVE_UI_HISTORY_RETENTION_SEC = 60 * 60;
 const COMPACT_SOUND_RECENCY_MS = 5_000;
+const DEGRADED_CONSECUTIVE_ISSUE_THRESHOLD = 3;
 const COLLECTION_SUMMARY_DISPLAY_LIMIT = 100;
+const DEFAULT_RUNTIME_CAPABILITIES: RuntimeCapabilities = {
+  gcs: true,
+};
 
 interface LiveCollectionCounts {
   collected: number;
@@ -119,11 +122,39 @@ function applyCollectionStatus(
   return { ...counts, discardedSilent: counts.discardedSilent + 1 };
 }
 
+function mergeLiveCurationProgress(
+  current: LiveCurationProgress | null,
+  next: LiveCurationProgress,
+): LiveCurationProgress {
+  if (!current) {
+    return next;
+  }
+  return {
+    candidate_segment_count: Math.max(current.candidate_segment_count, next.candidate_segment_count),
+    selected_segment_count: Math.max(current.selected_segment_count, next.selected_segment_count),
+    rejected_repetitive_count: Math.max(
+      current.rejected_repetitive_count,
+      next.rejected_repetitive_count,
+    ),
+    rejected_class_balance_count: Math.max(
+      current.rejected_class_balance_count,
+      next.rejected_class_balance_count,
+    ),
+    rejected_session_budget_count: Math.max(
+      current.rejected_session_budget_count,
+      next.rejected_session_budget_count,
+    ),
+    invalid_audio_count: Math.max(current.invalid_audio_count, next.invalid_audio_count),
+    write_error_count: Math.max(current.write_error_count, next.write_error_count),
+  };
+}
+
 interface LiveLatencySample {
   label: string;
   sequenceId: number;
   confidence: number | null;
-  observedAtMs: number;
+  eventStartSec: number;
+  eventEndSec: number;
   eventDelayMs: number;
   requestMs: number;
   backendMs: number;
@@ -147,39 +178,71 @@ export default function App() {
   const [liveCollectionCounts, setLiveCollectionCounts] = useState<LiveCollectionCounts>(
     () => emptyLiveCollectionCounts(),
   );
+  const [liveCurationProgress, setLiveCurationProgress] = useState<LiveCurationProgress | null>(null);
   const [collectionSummary, setCollectionSummary] = useState<LiveSessionEndResponse | null>(null);
   const [collectionFinalizing, setCollectionFinalizing] = useState(false);
+  const [finalizationError, setFinalizationError] = useState<string | null>(null);
+  const [captureIssue, setCaptureIssue] = useState<string | null>(null);
+  const [liveAudioState, setLiveAudioState] = useState<LiveAudioContextState | 'unknown'>('unknown');
+  const [liveConfidenceThreshold, setLiveConfidenceThreshold] = useState(
+    DEFAULT_LIVE_CONFIDENCE_THRESHOLD,
+  );
+  const [runtimeCapabilities, setRuntimeCapabilities] = useState<RuntimeCapabilities>(
+    DEFAULT_RUNTIME_CAPABILITIES,
+  );
   const [collectedRefreshToken, setCollectedRefreshToken] = useState(0);
   const [sessionName, setSessionName] = useState('');
   const [compactMode, setCompactMode] = useState(false);
+  const compactRecorderRef = useRef<HTMLElement | null>(null);
+  const workspaceTitleRef = useRef<HTMLHeadingElement | null>(null);
+  const compactModeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const focusBeforeCompactRef = useRef<HTMLElement | null>(null);
+  const wasCompactRef = useRef(false);
   const sessionNameRef = useRef('');
   const streamRef = useRef<MediaStream | null>(null);
+  const streamWatchdogCleanupRef = useRef<(() => void) | null>(null);
   const startedAtRef = useRef<number | null>(null);
   const recordingSessionRef = useRef(0);
-  const liveCleanupRef = useRef<(() => void) | null>(null);
+  const liveCleanupRef = useRef<LiveAudioCaptureController | null>(null);
   const liveInFlightRef = useRef(0);
   const liveSequenceRef = useRef(0);
   const liveSessionTokenRef = useRef('');
   const livePendingRequestsRef = useRef<Map<string, Set<Promise<void>>>>(new Map());
   const liveAbortControllersRef = useRef<Map<string, Set<AbortController>>>(new Map());
+  const finalizationAbortControllerRef = useRef<AbortController | null>(null);
+  const finalizationInFlightTokenRef = useRef<string | null>(null);
+  const liveConfidenceThresholdRef = useRef(DEFAULT_LIVE_CONFIDENCE_THRESHOLD);
+  const runtimeConfigRequestSequenceRef = useRef(0);
   const hasPendingLiveChunks = useMemo(
     () => hasPendingLiveChunkRecords(liveChunkRecords),
     [liveChunkRecords],
   );
 
   useEffect(() => {
-    if (status !== 'recording') {
-      return;
-    }
+    let active = true;
+    const requestSequence = runtimeConfigRequestSequenceRef.current + 1;
+    runtimeConfigRequestSequenceRef.current = requestSequence;
+    void fetchRuntimeConfig()
+      .then((config) => {
+        if (!active || requestSequence !== runtimeConfigRequestSequenceRef.current) {
+          return;
+        }
+        liveConfidenceThresholdRef.current = config.collection_confidence_threshold;
+        setLiveConfidenceThreshold(config.collection_confidence_threshold);
+        setRuntimeCapabilities(config.capabilities);
+      })
+      .catch(() => {
+        // Read-only rendering can use the documented default. A state-changing
+        // action retries configuration loading before it touches local data.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
-    const interval = window.setInterval(() => {
-      if (startedAtRef.current) {
-        setElapsedSec(Math.floor((Date.now() - startedAtRef.current) / 1000));
-      }
-    }, 250);
-
-    return () => window.clearInterval(interval);
-  }, [status]);
+  useEffect(() => {
+    notifyNativeAppReady();
+  }, []);
 
   useEffect(() => {
     if (status !== 'recording' && !hasPendingLiveChunks) {
@@ -188,7 +251,7 @@ export default function App() {
 
     const interval = window.setInterval(() => {
       setLiveChunkSnapshotMs(Date.now());
-    }, 250);
+    }, 1000);
 
     return () => window.clearInterval(interval);
   }, [hasPendingLiveChunks, status]);
@@ -196,9 +259,12 @@ export default function App() {
   useEffect(() => {
     return () => {
       const liveSessionToken = liveSessionTokenRef.current;
+      finalizationAbortControllerRef.current?.abort();
       stopLiveCapture({ clearTimeline: false, invalidateSession: true });
       stopTracks();
-      void finalizeLiveSession(liveSessionToken, { showSummary: false });
+      if (finalizationInFlightTokenRef.current !== liveSessionToken) {
+        void finalizeLiveSession(liveSessionToken, { showSummary: false });
+      }
     };
   }, []);
 
@@ -210,22 +276,45 @@ export default function App() {
 
   useEffect(() => {
     requestNativeWindowMode(compactMode);
+    if (compactMode) {
+      wasCompactRef.current = true;
+      window.requestAnimationFrame(() => compactRecorderRef.current?.focus());
+      return;
+    }
+    if (wasCompactRef.current) {
+      wasCompactRef.current = false;
+      window.requestAnimationFrame(() => {
+        const previous = focusBeforeCompactRef.current;
+        if (previous?.isConnected) {
+          previous.focus();
+        } else if (compactModeButtonRef.current) {
+          compactModeButtonRef.current.focus();
+        } else {
+          workspaceTitleRef.current?.focus();
+        }
+      });
+    }
   }, [compactMode]);
 
   useEffect(() => () => requestNativeWindowMode(false), []);
 
-  const durationLabel = useMemo(() => formatDuration(elapsedSec), [elapsedSec]);
-  const compactDetectedSound =
-    liveLatencySample &&
-    liveChunkSnapshotMs - liveLatencySample.observedAtMs <= COMPACT_SOUND_RECENCY_MS
-      ? liveLatencySample
-      : null;
+  const durationLabel = useMemo(() => formatTime(elapsedSec), [elapsedSec]);
+  const compactDetectedSound = liveLatencySample
+    && Math.max(0, elapsedSec * 1000 - liveLatencySample.eventEndSec * 1000) <= COMPACT_SOUND_RECENCY_MS
+    ? liveLatencySample
+    : null;
   const liveDurationSec = useMemo(() => {
     const latestFrameTime = liveSpectrogramFramesRef.current.at(-1)?.timestampSec ?? 0;
     const eventTimes = liveTimelineEvents.map((event) => event.endTimeSec);
     const chunkTailEndSec = latestLiveChunkTailEndSec(liveChunkRecords, liveChunkSnapshotMs);
     return Math.max(0, elapsedSec, chunkTailEndSec, latestFrameTime, ...eventTimes);
   }, [elapsedSec, liveChunkRecords, liveChunkSnapshotMs, liveSpectrogramVersion, liveTimelineEvents]);
+  const consecutiveDeliveryIssues = useMemo(
+    () => countConsecutiveDeliveryIssues(liveChunkRecords),
+    [liveChunkRecords],
+  );
+  const liveDegraded = status === 'recording'
+    && consecutiveDeliveryIssues >= DEGRADED_CONSECUTIVE_ISSUE_THRESHOLD;
   const liveViewportState = useMemo(
     () => resolveLiveViewport(liveDurationSec, liveViewportStartSec, liveAutoFollow, LIVE_VIEWPORT_SEC),
     [liveAutoFollow, liveDurationSec, liveViewportStartSec],
@@ -233,6 +322,8 @@ export default function App() {
 
   async function startRecording() {
     setError(null);
+    setFinalizationError(null);
+    setCaptureIssue(null);
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setStatus('error');
@@ -242,6 +333,14 @@ export default function App() {
 
     setStatus('starting');
     try {
+      const requestSequence = runtimeConfigRequestSequenceRef.current + 1;
+      runtimeConfigRequestSequenceRef.current = requestSequence;
+      const runtimeConfig = await fetchRuntimeConfig({ force: true });
+      if (requestSequence === runtimeConfigRequestSequenceRef.current) {
+        liveConfidenceThresholdRef.current = runtimeConfig.collection_confidence_threshold;
+        setLiveConfidenceThreshold(runtimeConfig.collection_confidence_threshold);
+        setRuntimeCapabilities(runtimeConfig.capabilities);
+      }
       const stream = await navigator.mediaDevices.getUserMedia(LIVE_MICROPHONE_CONSTRAINTS);
       streamRef.current = stream;
       assertAutomaticVoiceProcessingDisabled(stream);
@@ -249,8 +348,14 @@ export default function App() {
 
       recordingSessionRef.current = sessionId;
       setElapsedSec(0);
-      startedAtRef.current = Date.now();
-      await startLiveCapture(stream, sessionId);
+      const captureStarted = await startLiveCapture(stream, sessionId);
+      if (!captureStarted) {
+        return;
+      }
+      const streamAlive = installStreamWatchdog(stream, liveSessionTokenRef.current);
+      if (!streamAlive) {
+        return;
+      }
       setStatus('recording');
     } catch (err) {
       setStatus('error');
@@ -268,23 +373,40 @@ export default function App() {
     const liveSessionToken = liveSessionTokenRef.current;
     stopLiveCapture({ clearTimeline: false, invalidateSession: false });
     stopTracks();
-    setStatus('complete');
+    setStatus('finalizing');
     void finalizeLiveSession(liveSessionToken, { showSummary: true });
   }
 
-  function discardRecording() {
+  function stopRecordingAndKeepCollected() {
+    if (status !== 'recording') {
+      return;
+    }
+    if (!window.confirm(
+      '녹음을 지금 중단할까요? 이미 수집된 데이터는 유지되며, 아직 분석 중인 청크는 취소됩니다.',
+    )) {
+      return;
+    }
     const liveSessionToken = liveSessionTokenRef.current;
-    recordingSessionRef.current += 1;
-    stopLiveCapture({ clearTimeline: true, invalidateSession: true });
-    void finalizeLiveSession(liveSessionToken, { showSummary: false });
+    abortLiveRequests(liveSessionToken);
+    stopLiveCapture({ clearTimeline: false, invalidateSession: false });
     stopTracks();
-    startedAtRef.current = null;
-    setElapsedSec(0);
-    setError(null);
-    setStatus('idle');
+    setStatus('finalizing');
+    void finalizeLiveSession(liveSessionToken, { showSummary: true, waitForDrain: false });
   }
 
-  async function startLiveCapture(stream: MediaStream, recordingSessionId: number) {
+  function retryFinalization() {
+    const liveSessionToken = liveSessionTokenRef.current;
+    if (!finalizationError || !liveSessionToken.startsWith('session-')) {
+      return;
+    }
+    setStatus('finalizing');
+    void finalizeLiveSession(liveSessionToken, { showSummary: true });
+  }
+
+  async function startLiveCapture(
+    stream: MediaStream,
+    recordingSessionId: number,
+  ): Promise<boolean> {
     const liveSessionToken = `session-${Date.now()}-${recordingSessionId}`;
     liveSessionTokenRef.current = liveSessionToken;
     liveInFlightRef.current = 0;
@@ -303,13 +425,28 @@ export default function App() {
           onSpectrogramFrame: (frame) => handleLiveSpectrogramFrame(frame, liveSessionToken),
           spectrogramFps: LIVE_SPECTROGRAM_FPS,
           spectrogramBins: LIVE_SPECTROGRAM_BINS,
+          onAudioTimeUpdate: (audioTimeSec) => {
+            if (liveSessionToken === liveSessionTokenRef.current) {
+              updateAudioTimeline(audioTimeSec);
+            }
+          },
+          onStateChange: (audioState) => {
+            if (liveSessionToken === liveSessionTokenRef.current) {
+              handleLiveAudioStateChange(audioState, liveSessionToken);
+            }
+          },
         },
       );
-      if (liveSessionToken !== liveSessionTokenRef.current) {
+      if (
+        liveSessionToken !== liveSessionTokenRef.current
+        || streamRef.current !== stream
+      ) {
         cleanup();
-        return;
+        return false;
       }
+      startedAtRef.current = cleanup.captureStartedAtMs;
       liveCleanupRef.current = cleanup;
+      return true;
     } catch (err) {
       liveCleanupRef.current = null;
       setLiveDiagnostics((current) => recordLiveDiagnostic(current, 'failure', 0, errorMessage(err)));
@@ -332,6 +469,7 @@ export default function App() {
     }
     liveCleanupRef.current?.();
     liveCleanupRef.current = null;
+    setLiveAudioState('unknown');
     if (clearTimeline) {
       liveSequenceRef.current = 0;
       clearLiveTimelineState();
@@ -349,7 +487,82 @@ export default function App() {
     setLiveChunkRecords([]);
     setLiveChunkSnapshotMs(Date.now());
     setLiveCollectionCounts(emptyLiveCollectionCounts());
+    setLiveCurationProgress(null);
     setCollectionSummary(null);
+  }
+
+  function updateAudioTimeline(audioTimeSec: number) {
+    const nextElapsedSec = Math.max(0, Math.floor(audioTimeSec));
+    setElapsedSec((current) => Math.max(current, nextElapsedSec));
+  }
+
+  function handleLiveAudioStateChange(
+    audioState: LiveAudioContextState,
+    liveSessionToken: string,
+  ) {
+    setLiveAudioState(audioState);
+    if (audioState === 'running') {
+      setCaptureIssue(null);
+      return;
+    }
+    if (audioState === 'suspended') {
+      setCaptureIssue('오디오 처리가 일시 중지되었습니다. 녹음을 계속하려면 오디오 재개를 눌러 주세요.');
+      return;
+    }
+    if (audioState === 'closed') {
+      setCaptureIssue('오디오 처리 연결이 예기치 않게 종료되어 녹음을 중단했습니다. 수집 데이터를 정리합니다.');
+      stopLiveCapture({ clearTimeline: false, invalidateSession: false });
+      stopTracks();
+      setStatus('finalizing');
+      void finalizeLiveSession(liveSessionToken, { showSummary: true });
+      return;
+    }
+    setCaptureIssue(`오디오 처리가 중단되었습니다 (${audioState}). 오디오 재개를 눌러 주세요.`);
+  }
+
+  async function resumeLiveAudio() {
+    try {
+      await liveCleanupRef.current?.resume();
+      setCaptureIssue(null);
+    } catch (err) {
+      setCaptureIssue(errorMessage(err) ?? '오디오 처리를 재개하지 못했습니다.');
+    }
+  }
+
+  function installStreamWatchdog(stream: MediaStream, liveSessionToken: string): boolean {
+    streamWatchdogCleanupRef.current?.();
+    const track = stream.getAudioTracks?.()[0];
+    if (!track?.addEventListener) {
+      streamWatchdogCleanupRef.current = null;
+      return true;
+    }
+
+    const handleTrackEnded = () => {
+      if (
+        liveSessionToken !== liveSessionTokenRef.current
+        || streamRef.current !== stream
+      ) {
+        return;
+      }
+      streamWatchdogCleanupRef.current?.();
+      streamWatchdogCleanupRef.current = null;
+      setCaptureIssue('마이크 연결이 끊겨 녹음을 중단했습니다. 지금까지 수집된 데이터를 정리합니다.');
+      stopLiveCapture({ clearTimeline: false, invalidateSession: false });
+      stopTracks();
+      setStatus('finalizing');
+      void finalizeLiveSession(liveSessionToken, { showSummary: true });
+    };
+    track.addEventListener('ended', handleTrackEnded, { once: true });
+    streamWatchdogCleanupRef.current = () => {
+      track.removeEventListener('ended', handleTrackEnded);
+    };
+    // The track may have ended while the AudioContext graph was starting,
+    // before this listener could be attached. Re-check after attachment to
+    // close that race without missing an event between check and listen.
+    if (track.readyState === 'ended') {
+      handleTrackEnded();
+    }
+    return streamRef.current === stream;
   }
 
   async function waitForLiveDrain(liveSessionToken: string) {
@@ -370,32 +583,83 @@ export default function App() {
 
   async function finalizeLiveSession(
     liveSessionToken: string,
-    { showSummary }: { showSummary: boolean },
+    {
+      showSummary,
+      waitForDrain = showSummary,
+    }: { showSummary: boolean; waitForDrain?: boolean },
   ) {
     if (!liveSessionToken.startsWith('session-')) {
       return;
     }
+    if (finalizationInFlightTokenRef.current === liveSessionToken) {
+      return;
+    }
+    finalizationInFlightTokenRef.current = liveSessionToken;
+
+    const controller = new AbortController();
+    finalizationAbortControllerRef.current = controller;
+    let timedOut = false;
+    let timeout = 0;
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timeout = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        abortLiveRequests(liveSessionToken);
+        reject(new DOMException('Session finalization timed out.', 'TimeoutError'));
+      }, LIVE_SESSION_END_TIMEOUT_MS);
+    });
 
     if (showSummary) {
       setCollectionFinalizing(true);
-      // 분석 중인 마지막 청크들까지 수집에 반영한 뒤 세션을 닫는다.
-      await waitForLiveDrain(liveSessionToken);
+      setFinalizationError(null);
+      setStatus('finalizing');
     }
 
     try {
-      const summary = await endLiveSession(
-        liveSessionToken,
-        sessionNameRef.current.trim() || undefined,
-      );
+      if (showSummary && waitForDrain) {
+        // One user-visible deadline covers both draining the final chunks and
+        // persisting the session summary. This prevents a stalled chunk from
+        // extending finalization by its own request timeout.
+        await Promise.race([
+          waitForLiveDrain(liveSessionToken),
+          timeoutPromise,
+        ]);
+      }
+      const summary = await Promise.race([
+        endLiveSession(
+          liveSessionToken,
+          sessionNameRef.current.trim() || undefined,
+          controller.signal,
+        ),
+        timeoutPromise,
+      ]);
       if (showSummary && liveSessionToken === liveSessionTokenRef.current) {
         setCollectionSummary(summary);
         liveSessionTokenRef.current = `inactive-${Date.now()}-${recordingSessionRef.current}`;
         liveInFlightRef.current = 0;
+        startedAtRef.current = null;
+        setStatus('complete');
+        setFinalizationError(null);
       }
       setCollectedRefreshToken((token) => token + 1);
     } catch (err) {
-      console.warn('[Cochl.Sense Cloud Live Demo] 수집 세션 종료 실패:', errorMessage(err));
+      const detail = timedOut
+        ? `세션 종료 확인이 ${Math.round(LIVE_SESSION_END_TIMEOUT_MS / 1000)}초 안에 완료되지 않았습니다.`
+        : (errorMessage(err) ?? '세션 종료 요청에 실패했습니다.');
+      if (showSummary && liveSessionToken === liveSessionTokenRef.current) {
+        setFinalizationError(`${detail} 수집된 데이터는 유지됩니다. 다시 시도해 주세요.`);
+        setStatus('error');
+      } else {
+        console.warn('[Cochl.Sense Cloud Live Demo] 수집 세션 종료 실패:', detail);
+      }
     } finally {
+      window.clearTimeout(timeout);
+      if (finalizationAbortControllerRef.current === controller) {
+        finalizationAbortControllerRef.current = null;
+      }
+      if (finalizationInFlightTokenRef.current === liveSessionToken) {
+        finalizationInFlightTokenRef.current = null;
+      }
       if (showSummary) {
         setCollectionFinalizing(false);
       }
@@ -455,6 +719,7 @@ export default function App() {
       return;
     }
     appendLiveSpectrogramFrame(frame);
+    updateAudioTimeline(frame.timestampSec);
   }
 
   function appendLiveSpectrogramFrame(frame: LiveSpectrogramFrame) {
@@ -463,7 +728,6 @@ export default function App() {
       frame,
       MAX_LIVE_SPECTROGRAM_FRAMES,
     );
-    setLiveSpectrogramVersion((version) => version + 1);
   }
 
   async function submitLiveWindow(
@@ -502,7 +766,7 @@ export default function App() {
       currentRecord = completeLiveChunkRecord(
         currentRecord,
         response,
-        LIVE_CONFIDENCE_THRESHOLD,
+        liveConfidenceThresholdRef.current,
         responseReceivedAtMs,
       );
       upsertLiveChunkState(currentRecord);
@@ -510,8 +774,18 @@ export default function App() {
       if (collectionStatus) {
         setLiveCollectionCounts((current) => applyCollectionStatus(current, collectionStatus));
       }
+      if (response.curation_progress) {
+        const nextProgress = response.curation_progress;
+        setLiveCurationProgress((current) => mergeLiveCurationProgress(
+          current,
+          nextProgress,
+        ));
+      }
 
-      const timelineEvents = liveTimelineEventsFromResponse(response, LIVE_CONFIDENCE_THRESHOLD);
+      const timelineEvents = liveTimelineEventsFromResponse(
+        response,
+        liveConfidenceThresholdRef.current,
+      );
       setLiveTimelineEvents((current) => retainRecentLiveTimelineEvents(
         timelineEvents.length ? mergeLiveTimelineEvents(current, timelineEvents) : current,
         currentRecord.windowEndSec,
@@ -519,7 +793,8 @@ export default function App() {
       ));
       if (timelineEvents.length) {
         const detectedEvents = response.sound_events.filter(
-          (event) => typeof event.confidence === 'number' && event.confidence >= LIVE_CONFIDENCE_THRESHOLD,
+          (event) => typeof event.confidence === 'number'
+            && event.confidence >= liveConfidenceThresholdRef.current,
         );
         detectedEvents.forEach((event) => {
           recordLiveLatency({
@@ -579,18 +854,29 @@ export default function App() {
       label: event.label,
       sequenceId: response.sequence_id,
       confidence: event.confidence,
-      observedAtMs: markerCreatedAtMs,
+      eventStartSec: event.start_time_sec,
+      eventEndSec: event.end_time_sec,
       eventDelayMs: positiveRoundedMs(markerCreatedAtMs - (recordingStartedAtMs + event.start_time_sec * 1000)),
       requestMs: positiveRoundedMs(responseReceivedAtMs - requestStartedAtMs),
       backendMs: positiveRoundedMs(response.processing_time_ms),
       windowEndDelayMs: positiveRoundedMs(markerCreatedAtMs - (recordingStartedAtMs + response.window_end_sec * 1000)),
       windowCallbackDelayMs: positiveRoundedMs(markerCreatedAtMs - windowEmittedAtMs),
     };
-    setLiveLatencySample(sample);
+    setLiveLatencySample((current) => {
+      if (!current) {
+        return sample;
+      }
+      if (sample.sequenceId !== current.sequenceId) {
+        return sample.sequenceId > current.sequenceId ? sample : current;
+      }
+      return sample.eventStartSec >= current.eventStartSec ? sample : current;
+    });
     console.info('[Cochl.Sense Cloud Live Demo latency]', sample);
   }
 
   function stopTracks() {
+    streamWatchdogCleanupRef.current?.();
+    streamWatchdogCleanupRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
   }
@@ -652,16 +938,26 @@ export default function App() {
   }
 
   const canStart =
-    !collectionFinalizing && (status === 'idle' || status === 'error' || status === 'complete');
+    !collectionFinalizing
+    && !finalizationError
+    && (status === 'idle' || status === 'error' || status === 'complete');
   const canComplete = status === 'recording';
-  const canDiscard =
-    !collectionFinalizing && status !== 'starting' && status !== 'idle';
+  const canStopAndKeep = status === 'recording';
   const canDownloadCsv = status === 'complete' && liveChunkRecords.length > 0;
   const hasCollectionActivity =
     liveCollectionCounts.collected > 0 ||
     liveCollectionCounts.discardedSilent > 0 ||
     liveCollectionCounts.discardedSpeech > 0 ||
     liveCollectionCounts.discardedLate > 0;
+  const ignoredSegmentCount = liveCurationProgress
+    ? Math.max(
+      0,
+      liveCurationProgress.candidate_segment_count - liveCurationProgress.selected_segment_count,
+    )
+    : 0;
+  const otherIgnoredSegmentCount = liveCurationProgress
+    ? liveCurationProgress.invalid_audio_count + liveCurationProgress.write_error_count
+    : 0;
 
   return (
     <main className={`app-shell${compactMode ? ' app-shell-compact' : ''}`}>
@@ -670,7 +966,12 @@ export default function App() {
         aria-labelledby={compactMode ? 'compact-recorder-title' : 'app-title'}
       >
         {compactMode && (
-          <section className="compact-recorder" aria-label="작게 보기 녹음 상태">
+          <section
+            ref={compactRecorderRef}
+            className="compact-recorder"
+            aria-label="작게 보기 녹음 상태"
+            tabIndex={-1}
+          >
             <header className="compact-recorder-header">
               <h1 id="compact-recorder-title" className="compact-recording-indicator">
                 <span aria-hidden="true" />
@@ -704,8 +1005,8 @@ export default function App() {
                 <AudioLines size={21} strokeWidth={2.2} />
               </span>
               <span className="compact-sound-copy">
-                <span>지금 들리는 소리</span>
-                <strong>{compactDetectedSound?.label ?? '귀 기울이는 중…'}</strong>
+                <span>최근 감지 소리</span>
+                <strong>{compactDetectedSound?.label ?? '새 감지를 기다리는 중…'}</strong>
               </span>
               {typeof compactDetectedSound?.confidence === 'number' && (
                 <span className="compact-sound-confidence">
@@ -713,6 +1014,12 @@ export default function App() {
                 </span>
               )}
             </div>
+
+            {liveDegraded && (
+              <p className="compact-degraded-warning" role="status">
+                전송이 불안정합니다 · 연속 {consecutiveDeliveryIssues}개 누락/실패
+              </p>
+            )}
 
             <button
               className="compact-stop-button"
@@ -734,15 +1041,19 @@ export default function App() {
         <header className="workspace-header">
           <div>
             <p className="eyebrow">Cochl.Sense Cloud API</p>
-            <h1 id="app-title">실시간 스트리밍 현황판</h1>
+            <h1 ref={workspaceTitleRef} id="app-title" tabIndex={-1}>실시간 스트리밍 현황판</h1>
           </div>
           <div className="workspace-header-actions">
-            <StatusBadge status={status} />
+            <StatusBadge status={status} degraded={liveDegraded} />
             {status === 'recording' && (
               <button
+                ref={compactModeButtonRef}
                 type="button"
                 className="compact-mode-button"
-                onClick={() => setCompactMode(true)}
+                onClick={() => {
+                  focusBeforeCompactRef.current = document.activeElement as HTMLElement | null;
+                  setCompactMode(true);
+                }}
               >
                 <Minimize2 size={16} aria-hidden="true" />
                 작게 보기
@@ -752,13 +1063,14 @@ export default function App() {
         </header>
 
         <div className="recording-surface">
-          <div className="timer" aria-live="polite">
+          <div className="timer">
             {durationLabel}
           </div>
           <div className="meta-row">
             <span>중요 구간만 자동 저장</span>
             <span>원본 저장 안 함 · 화면 이력 최근 60분</span>
             <span>입력 48 kHz · 모노 · 음성 보정 끔</span>
+            <span>수집 기준 신뢰도 {Math.round(liveConfidenceThreshold * 100)}%</span>
             {(status === 'recording' || hasCollectionActivity) && (
               <span
                 aria-label="실시간 데이터 수집 현황"
@@ -766,6 +1078,21 @@ export default function App() {
               >
                 수집 후보 청크 {liveCollectionCounts.collected} · 무음 제외 {liveCollectionCounts.discardedSilent} · 음성 제외{' '}
                 {liveCollectionCounts.discardedSpeech} · 종료 후 제외 {liveCollectionCounts.discardedLate}
+              </span>
+            )}
+            {status === 'recording' && liveCurationProgress
+              && liveCurationProgress.candidate_segment_count > 0 && (
+              <span
+                aria-label="실시간 세그먼트 최종 판정"
+                aria-live="polite"
+                title={`손상 오디오 ${liveCurationProgress.invalid_audio_count} · 저장 오류 ${liveCurationProgress.write_error_count}`}
+              >
+                세그먼트 판정 후보 {liveCurationProgress.candidate_segment_count} · 선택{' '}
+                {liveCurationProgress.selected_segment_count} · 무시 {ignoredSegmentCount} (반복{' '}
+                {liveCurationProgress.rejected_repetitive_count} · 균형{' '}
+                {liveCurationProgress.rejected_class_balance_count} · 상한{' '}
+                {liveCurationProgress.rejected_session_budget_count}
+                {otherIgnoredSegmentCount > 0 && ` · 기타 ${otherIgnoredSegmentCount}`})
               </span>
             )}
             {liveLatencySample && (
@@ -779,7 +1106,9 @@ export default function App() {
           </div>
           <LiveSpectrogramPanel
             frames={liveSpectrogramFramesRef.current}
+            framesRef={liveSpectrogramFramesRef}
             frameVersion={liveSpectrogramVersion}
+            active={status === 'recording'}
             events={liveTimelineEvents}
             diagnostics={liveDiagnostics}
             viewport={liveViewportState.viewport}
@@ -816,17 +1145,57 @@ export default function App() {
               <Square size={18} aria-hidden="true" />
               완료
             </button>
-            <button type="button" onClick={discardRecording} disabled={!canDiscard}>
-              <Trash2 size={18} aria-hidden="true" />
-              폐기
+            <button
+              type="button"
+              onClick={stopRecordingAndKeepCollected}
+              disabled={!canStopAndKeep}
+              title="이미 수집된 데이터는 유지하고, 분석 중인 청크를 취소한 뒤 녹음을 중단합니다."
+            >
+              <Pause size={18} aria-hidden="true" />
+              중단 (수집분 유지)
             </button>
           </div>
         </div>
 
+        {liveDegraded && (
+          <div className="notice warning" role="status">
+            <AlertTriangle size={18} aria-hidden="true" />
+            <span>
+              실시간 전송이 불안정합니다. 최근 {consecutiveDeliveryIssues}개 청크가 연속으로
+              누락되거나 실패했습니다. 네트워크와 API 상태를 확인해 주세요.
+            </span>
+          </div>
+        )}
+
+        {captureIssue && (
+          <div className="notice warning" role="status">
+            <AlertTriangle size={18} aria-hidden="true" />
+            <span>{captureIssue}</span>
+            {status === 'recording'
+              && liveAudioState !== 'running'
+              && liveAudioState !== 'closed'
+              && liveAudioState !== 'unknown' && (
+              <button type="button" onClick={() => void resumeLiveAudio()}>
+                오디오 재개
+              </button>
+            )}
+          </div>
+        )}
+
         {collectionFinalizing && (
           <div className="notice progress" role="status">
             <RefreshCw size={18} aria-hidden="true" />
-            수집 데이터를 정리하고 있습니다.
+            마지막 청크와 수집 데이터를 정리하고 있습니다. 잠시만 기다려 주세요.
+          </div>
+        )}
+
+        {finalizationError && (
+          <div className="notice error notice-with-action" role="alert">
+            <AlertTriangle size={18} aria-hidden="true" />
+            <span>{finalizationError}</span>
+            <button type="button" onClick={retryFinalization} disabled={collectionFinalizing}>
+              종료 다시 시도
+            </button>
           </div>
         )}
 
@@ -841,6 +1210,7 @@ export default function App() {
 
         <CollectedSessionsPanel
           refreshToken={collectedRefreshToken}
+          capabilities={runtimeCapabilities}
         />
         </div>
       </section>
@@ -850,6 +1220,25 @@ export default function App() {
 
 interface NativeWindowModeHandler {
   postMessage(message: { compact: boolean }): void;
+}
+
+interface NativeAppReadyHandler {
+  postMessage(message: { ready: true }): void;
+}
+
+function notifyNativeAppReady() {
+  const webkitWindow = window as Window & {
+    webkit?: {
+      messageHandlers?: {
+        appReady?: NativeAppReadyHandler;
+      };
+    };
+  };
+  try {
+    webkitWindow.webkit?.messageHandlers?.appReady?.postMessage({ ready: true });
+  } catch {
+    // Regular browsers do not expose the native macOS readiness bridge.
+  }
 }
 
 function requestNativeWindowMode(compact: boolean) {
@@ -896,7 +1285,7 @@ function positiveRoundedMs(value: number): number {
 }
 
 function formatLiveLatencyLabel(sample: LiveLatencySample): string {
-  return `최근 지연: ${sample.label} ${formatLatency(sample.eventDelayMs)} · 요청 ${formatLatency(sample.requestMs)}`;
+  return `최근 API 요청: ${formatLatency(sample.requestMs)} · ${sample.label} 감지까지 ${formatLatency(sample.eventDelayMs)}`;
 }
 
 function formatLiveLatencyTitle(sample: LiveLatencySample): string {
@@ -991,587 +1380,45 @@ function formatIsoTimestamp(value: string): string {
   });
 }
 
-function StatusBadge({ status }: { status: RecorderStatus }) {
+function StatusBadge({
+  status,
+  degraded = false,
+}: {
+  status: RecorderStatus;
+  degraded?: boolean;
+}) {
   const labels: Record<RecorderStatus, string> = {
     idle: '대기',
     starting: '마이크 준비 중',
     recording: '녹음 중',
+    finalizing: '수집 정리 중',
     complete: '완료',
     error: '확인 필요',
   };
 
-  return <span className={`status-badge status-${status}`}>{labels[status]}</span>;
-}
-
-interface AnalysisPanelProps {
-  analysis: AnalysisResponse;
-  recordingFile: File | null;
-}
-
-export function AnalysisPanel({ analysis, recordingFile }: AnalysisPanelProps) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioBufferRef = useRef<AudioBuffer | null>(null);
-  const segmentSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const segmentContextRef = useRef<AudioContext | null>(null);
-  const recordingSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const recordingContextRef = useRef<AudioContext | null>(null);
-  const recordingStartedAtRef = useRef(0);
-  const recordingStartedOffsetRef = useRef(0);
-  const recordingAnimationRef = useRef<number | null>(null);
-  const segmentEndRef = useRef<number | null>(null);
-  const [audioUrl, setAudioUrl] = useState('');
-  const [peaks, setPeaks] = useState<number[]>([]);
-  const [audioDurationSec, setAudioDurationSec] = useState<number | null>(null);
-  const [playbackError, setPlaybackError] = useState<string | null>(null);
-  const [segmentPlaybackMode, setSegmentPlaybackMode] = useState<SegmentPlaybackMode>('loading');
-  const [recordingPlaybackSec, setRecordingPlaybackSec] = useState(0);
-  const [isRecordingPlaying, setIsRecordingPlaying] = useState(false);
-  const durationSec = useMemo(
-    () => resolveDurationSec(analysis, audioDurationSec),
-    [analysis, audioDurationSec],
-  );
-  const canPlaySegment =
-    segmentPlaybackMode === 'buffer' || (segmentPlaybackMode === 'native' && Boolean(audioUrl));
-  const hasDecodedRecordingPlayer = segmentPlaybackMode === 'buffer';
-
-  useEffect(() => {
-    let cancelled = false;
-    const playbackUrls: string[] = [];
-
-    function setPlaybackUrl(blob: Blob) {
-      const url = URL.createObjectURL(blob);
-      playbackUrls.push(url);
-      setAudioUrl(url);
-    }
-
-    async function decodeWaveform() {
-      setAudioUrl('');
-      setSegmentPlaybackMode('loading');
-      audioBufferRef.current = null;
-      const AudioContextCtor = getAudioContextConstructor();
-      if (!recordingFile || !URL.createObjectURL) {
-        setPeaks([]);
-        return;
-      }
-      if (!AudioContextCtor) {
-        setPeaks([]);
-        setPlaybackUrl(recordingFile);
-        setSegmentPlaybackMode('native');
-        return;
-      }
-
-      let context: AudioContext | null = null;
-      try {
-        context = new AudioContextCtor();
-        const buffer = await recordingFile.arrayBuffer();
-        const decoded = await context.decodeAudioData(buffer.slice(0));
-        if (cancelled) {
-          await context.close();
-          return;
-        }
-        audioBufferRef.current = decoded;
-        setAudioDurationSec(decoded.duration);
-        setRecordingPlaybackSec(0);
-        setPeaks(peaksFromSamples(decoded.getChannelData(0), 160));
-        setSegmentPlaybackMode('buffer');
-        await context.close();
-      } catch {
-        if (!cancelled) {
-          audioBufferRef.current = null;
-          setPeaks([]);
-          setPlaybackUrl(recordingFile);
-          setSegmentPlaybackMode('native');
-        }
-        if (context) {
-          await context.close().catch(() => undefined);
-        }
-      }
-    }
-
-    void decodeWaveform();
-    return () => {
-      cancelled = true;
-      playbackUrls.forEach((url) => URL.revokeObjectURL(url));
-    };
-  }, [recordingFile]);
-
-  useEffect(() => {
-    return () => {
-      stopBufferedSegment();
-      stopRecordingPlayback({ resetPosition: false });
-    };
-  }, []);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) {
-      return;
-    }
-
-    drawWaveform(canvas, peaks);
-  }, [peaks]);
-
-  async function playSegment(event: SoundEvent) {
-    setPlaybackError(null);
-    const playedFromBuffer = await playBufferedSegment(event).catch(() => false);
-    if (playedFromBuffer) {
-      return;
-    }
-
-    const audio = audioRef.current;
-    if (!audio || !audioUrl) {
-      setPlaybackError('재생할 녹음 파일을 찾지 못했습니다.');
-      return;
-    }
-
-    try {
-      segmentEndRef.current = event.end_time_sec;
-      audio.currentTime = Math.max(0, event.start_time_sec);
-      await audio.play();
-    } catch {
-      if (!audio.paused) {
-        setPlaybackError(null);
-        return;
-      }
-      segmentEndRef.current = null;
-      setPlaybackError('녹음 파일을 재생하지 못했습니다. 오디오 컨트롤에서 직접 재생해 보거나 다시 녹음해 주세요.');
-    }
-  }
-
-  async function playBufferedSegment(event: SoundEvent): Promise<boolean> {
-    const buffer = audioBufferRef.current;
-    const AudioContextCtor = getAudioContextConstructor();
-    if (!buffer || !AudioContextCtor) {
-      return false;
-    }
-
-    const startTimeSec = clamp(event.start_time_sec, 0, buffer.duration);
-    const endTimeSec = clamp(event.end_time_sec, startTimeSec, buffer.duration);
-    const segmentDurationSec = endTimeSec - startTimeSec;
-    if (segmentDurationSec <= 0) {
-      return false;
-    }
-
-    stopBufferedSegment();
-    stopRecordingPlayback({ resetPosition: false });
-    const nativeAudio = audioRef.current;
-    if (nativeAudio) {
-      nativeAudio.pause();
-      try {
-        nativeAudio.currentTime = startTimeSec;
-      } catch {
-        // The decoded buffer is the source of truth for segment playback.
-      }
-    }
-
-    const context = new AudioContextCtor();
-    const source = context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(context.destination);
-    source.onended = () => {
-      if (segmentSourceRef.current === source) {
-        segmentSourceRef.current = null;
-      }
-      if (segmentContextRef.current === context) {
-        segmentContextRef.current = null;
-        void context.close().catch(() => undefined);
-      }
-    };
-    segmentSourceRef.current = source;
-    segmentContextRef.current = context;
-
-    try {
-      if (context.state === 'suspended') {
-        await context.resume();
-      }
-      source.start(0, startTimeSec, segmentDurationSec);
-      return true;
-    } catch (error) {
-      stopBufferedSegment();
-      throw error;
-    }
-  }
-
-  function stopBufferedSegment() {
-    const source = segmentSourceRef.current;
-    const context = segmentContextRef.current;
-    segmentSourceRef.current = null;
-    segmentContextRef.current = null;
-
-    if (source) {
-      source.onended = null;
-      try {
-        source.stop();
-      } catch {
-        // Source nodes throw if they have not started or already ended.
-      }
-      try {
-        source.disconnect();
-      } catch {
-        // Ignore cleanup errors from already-disconnected nodes.
-      }
-    }
-
-    if (context) {
-      void context.close().catch(() => undefined);
-    }
-  }
-
-  async function toggleRecordingPlayback() {
-    if (isRecordingPlaying) {
-      stopRecordingPlayback({ resetPosition: false });
-      return;
-    }
-
-    await playRecordingFrom(recordingPlaybackSec);
-  }
-
-  async function playRecordingFrom(offsetSec: number) {
-    const buffer = audioBufferRef.current;
-    const AudioContextCtor = getAudioContextConstructor();
-    if (!buffer || !AudioContextCtor) {
-      setPlaybackError('재생할 녹음 파일을 찾지 못했습니다.');
-      return;
-    }
-
-    stopBufferedSegment();
-    stopRecordingPlayback({ resetPosition: false });
-    setPlaybackError(null);
-
-    const startOffset = clamp(offsetSec >= buffer.duration ? 0 : offsetSec, 0, buffer.duration);
-    const context = new AudioContextCtor();
-    const source = context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(context.destination);
-    source.onended = () => {
-      if (recordingSourceRef.current !== source) {
-        return;
-      }
-      recordingSourceRef.current = null;
-      recordingContextRef.current = null;
-      stopRecordingAnimation();
-      setIsRecordingPlaying(false);
-      setRecordingPlaybackSec(buffer.duration);
-      void context.close().catch(() => undefined);
-    };
-
-    try {
-      if (context.state === 'suspended') {
-        await context.resume();
-      }
-      recordingSourceRef.current = source;
-      recordingContextRef.current = context;
-      recordingStartedAtRef.current = context.currentTime;
-      recordingStartedOffsetRef.current = startOffset;
-      setRecordingPlaybackSec(startOffset);
-      setIsRecordingPlaying(true);
-      source.start(0, startOffset);
-      startRecordingAnimation();
-    } catch {
-      stopRecordingPlayback({ resetPosition: false });
-      setPlaybackError('녹음 파일을 재생하지 못했습니다. 다시 녹음해 주세요.');
-    }
-  }
-
-  function stopRecordingPlayback({ resetPosition }: { resetPosition: boolean }) {
-    const currentPosition = currentRecordingPlaybackSec();
-    const source = recordingSourceRef.current;
-    const context = recordingContextRef.current;
-    recordingSourceRef.current = null;
-    recordingContextRef.current = null;
-    stopRecordingAnimation();
-
-    if (source) {
-      source.onended = null;
-      try {
-        source.stop();
-      } catch {
-        // Source nodes throw if they have not started or already ended.
-      }
-      try {
-        source.disconnect();
-      } catch {
-        // Ignore cleanup errors from already-disconnected nodes.
-      }
-    }
-
-    if (context) {
-      void context.close().catch(() => undefined);
-    }
-
-    setIsRecordingPlaying(false);
-    setRecordingPlaybackSec(resetPosition ? 0 : currentPosition);
-  }
-
-  function currentRecordingPlaybackSec(): number {
-    const buffer = audioBufferRef.current;
-    const context = recordingContextRef.current;
-    if (!buffer || !context || !recordingSourceRef.current) {
-      return recordingPlaybackSec;
-    }
-
-    return clamp(
-      recordingStartedOffsetRef.current + context.currentTime - recordingStartedAtRef.current,
-      0,
-      buffer.duration,
-    );
-  }
-
-  function startRecordingAnimation() {
-    stopRecordingAnimation();
-    const tick = () => {
-      setRecordingPlaybackSec(currentRecordingPlaybackSec());
-      recordingAnimationRef.current = window.requestAnimationFrame(tick);
-    };
-    recordingAnimationRef.current = window.requestAnimationFrame(tick);
-  }
-
-  function stopRecordingAnimation() {
-    if (recordingAnimationRef.current !== null) {
-      window.cancelAnimationFrame(recordingAnimationRef.current);
-      recordingAnimationRef.current = null;
-    }
-  }
-
-  function handleRecordingSeek(event: ChangeEvent<HTMLInputElement>) {
-    const nextPosition = Number(event.currentTarget.value);
-    setRecordingPlaybackSec(nextPosition);
-    if (isRecordingPlaying) {
-      void playRecordingFrom(nextPosition);
-    }
-  }
-
-  function handleNativeAudioPlay() {
-    stopBufferedSegment();
-    stopRecordingPlayback({ resetPosition: false });
-    segmentEndRef.current = null;
-    setPlaybackError(null);
-  }
-
-  function handleTimeUpdate() {
-    const audio = audioRef.current;
-    const segmentEnd = segmentEndRef.current;
-    if (!audio || segmentEnd === null) {
-      return;
-    }
-    if (audio.currentTime >= segmentEnd) {
-      audio.pause();
-      segmentEndRef.current = null;
-    }
-  }
-
   return (
-    <section className="results" aria-label="분석 결과">
-      <div className="result-header">
-        <div>
-          <p className="eyebrow">분석 결과</p>
-          <h2>소리 이벤트 타임라인</h2>
-        </div>
-        <span>{analysis.usage.processing_time_ms} ms</span>
-      </div>
-
-      <div className="waveform-panel">
-        <div className="waveform-toolbar">
-          <div>
-            <h3>녹음 파형</h3>
-            <p>
-              구간을 누르면 해당 위치부터 재생합니다.
-            </p>
-          </div>
-          <span>{formatTime(durationSec)}</span>
-        </div>
-
-        <div className="waveform-stage" aria-label="녹음 파형">
-          <canvas ref={canvasRef} className="waveform-canvas" aria-hidden="true" />
-          {analysis.sound_events.map((event, index) => (
-            <button
-              key={`${event.label}-${event.start_time_sec}-${event.end_time_sec}-${index}`}
-              type="button"
-              className="event-overlay"
-              style={eventOverlayStyle(event, durationSec)}
-              disabled={!canPlaySegment}
-              onClick={() => playSegment(event)}
-              aria-label={`${event.label} 구간 재생 ${formatTime(event.start_time_sec)}-${formatTime(
-                event.end_time_sec,
-              )}`}
-              title={`${event.label} ${formatTime(event.start_time_sec)}-${formatTime(
-                event.end_time_sec,
-              )}`}
-            >
-              <span>{event.label}</span>
-            </button>
-          ))}
-        </div>
-
-        {hasDecodedRecordingPlayer ? (
-          <div className="recording-player" aria-label="녹음 재생 컨트롤">
-            <button
-              type="button"
-              className="recording-player-button"
-              onClick={() => void toggleRecordingPlayback()}
-              aria-label={isRecordingPlaying ? '녹음 일시정지' : '녹음 재생'}
-            >
-              {isRecordingPlaying ? <Pause size={18} aria-hidden="true" /> : <Play size={18} aria-hidden="true" />}
-            </button>
-            <span className="recording-player-time">{formatTime(recordingPlaybackSec)}</span>
-            <input
-              type="range"
-              aria-label="녹음 재생 위치"
-              min="0"
-              max={audioBufferRef.current?.duration ?? durationSec}
-              step="0.01"
-              value={Math.min(recordingPlaybackSec, audioBufferRef.current?.duration ?? durationSec)}
-              onChange={handleRecordingSeek}
-            />
-            <span className="recording-player-time">{formatTime(audioBufferRef.current?.duration ?? durationSec)}</span>
-          </div>
-        ) : audioUrl ? (
-          <audio
-            ref={audioRef}
-            src={audioUrl}
-            controls
-            preload="auto"
-            className="audio-player"
-            aria-label="브라우저 오디오 컨트롤"
-            onLoadedMetadata={(event) => setAudioDurationSec(event.currentTarget.duration)}
-            onPlay={handleNativeAudioPlay}
-            onPlaying={handleNativeAudioPlay}
-            onTimeUpdate={handleTimeUpdate}
-          >
-            <track kind="captions" />
-          </audio>
-        ) : (
-          <p className="waveform-note">
-            {recordingFile ? '오디오 컨트롤을 준비하는 중입니다.' : '녹음 파일이 없어 파형 재생을 사용할 수 없습니다.'}
-          </p>
-        )}
-        {playbackError && (
-          <div className="waveform-error" role="alert">
-            <AlertTriangle size={16} aria-hidden="true" />
-            {playbackError}
-          </div>
-        )}
-      </div>
-
-      {analysis.sound_events.length ? (
-        <ol className="event-list">
-          {analysis.sound_events.map((event, index) => (
-            <li key={`${event.label}-${event.start_time_sec}-${index}`}>
-              <EventRow event={event} onPlay={() => playSegment(event)} canPlay={canPlaySegment} />
-            </li>
-          ))}
-        </ol>
-      ) : (
-        <div className="empty-state">
-          <CheckCircle2 size={20} aria-hidden="true" />
-          감지된 소리 이벤트가 없습니다.
-        </div>
-      )}
-
-      {analysis.speech_segments.length > 0 && (
-        <section className="subsection">
-          <h3>전사</h3>
-          {analysis.speech_segments.map((segment, index) => (
-            <p key={`${segment.start_time_sec}-${index}`}>
-              <strong>{segment.speaker_name || segment.speaker || 'Speaker'}</strong>
-              {' '}
-              {segment.transcript}
-            </p>
-          ))}
-        </section>
-      )}
-
-      {analysis.audio_insights && (
-        <section className="subsection">
-          <h3>Audio Insights</h3>
-          <p>{analysis.audio_insights.situation_summary || '요약 정보가 없습니다.'}</p>
-        </section>
-      )}
-    </section>
+    <span
+      className={`status-badge status-${degraded ? 'degraded' : status}`}
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+    >
+      {degraded ? '전송 불안정' : labels[status]}
+    </span>
   );
 }
 
-function EventRow({
-  event,
-  onPlay,
-  canPlay,
-}: {
-  event: SoundEvent;
-  onPlay: () => void;
-  canPlay: boolean;
-}) {
-  const confidence =
-    typeof event.confidence === 'number' ? `${Math.round(event.confidence * 100)}%` : 'N/A';
-
-  return (
-    <div className="event-row">
-      <span className="time-range">
-        {event.start_time_sec.toFixed(1)}s - {event.end_time_sec.toFixed(1)}s
-      </span>
-      <span className="event-label">{event.label}</span>
-      <span className="confidence">{confidence}</span>
-      <button type="button" className="play-segment" onClick={onPlay} disabled={!canPlay}>
-        구간 재생
-      </button>
-    </div>
-  );
-}
-
-function formatDuration(totalSeconds: number): string {
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-}
-
-function resolveDurationSec(analysis: AnalysisResponse, audioDurationSec: number | null): number {
-  const candidates = [
-    analysis.recording.duration_sec,
-    analysis.usage.audio_duration_sec,
-    audioDurationSec,
-    ...analysis.sound_events.map((event) => event.end_time_sec),
-  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
-
-  return Math.max(1, ...candidates);
-}
-
-function drawWaveform(canvas: HTMLCanvasElement, peaks: number[]) {
-  const context = canvas.getContext('2d');
-  if (!context) {
-    return;
+function countConsecutiveDeliveryIssues(records: LiveChunkRecord[]): number {
+  const settled = records
+    .filter((record) => record.status !== 'PENDING')
+    .sort((left, right) => left.sequenceId - right.sequenceId);
+  let count = 0;
+  for (let index = settled.length - 1; index >= 0; index -= 1) {
+    const status = settled[index].status;
+    if (status !== 'FAIL' && status !== 'SKIP') {
+      break;
+    }
+    count += 1;
   }
-
-  const rect = canvas.getBoundingClientRect();
-  const width = Math.max(320, Math.floor(rect.width || 720));
-  const height = Math.max(120, Math.floor(rect.height || 150));
-  const scale = window.devicePixelRatio || 1;
-
-  canvas.width = width * scale;
-  canvas.height = height * scale;
-  context.setTransform(scale, 0, 0, scale, 0, 0);
-  context.clearRect(0, 0, width, height);
-  context.fillStyle = '#eef4f2';
-  context.fillRect(0, 0, width, height);
-  context.strokeStyle = '#c8d8d3';
-  context.beginPath();
-  context.moveTo(0, height / 2);
-  context.lineTo(width, height / 2);
-  context.stroke();
-
-  const safePeaks = peaks.length ? peaks : Array.from({ length: 160 }, (_, index) => {
-    return 0.08 + Math.sin(index / 8) * 0.03;
-  });
-  const barWidth = width / safePeaks.length;
-  context.fillStyle = '#26736d';
-
-  safePeaks.forEach((peak, index) => {
-    const barHeight = Math.max(2, peak * (height - 28));
-    const x = index * barWidth;
-    const y = (height - barHeight) / 2;
-    context.fillRect(x, y, Math.max(1, barWidth * 0.72), barHeight);
-  });
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
+  return count;
 }

@@ -1,44 +1,8 @@
-export interface RecordingMetadata {
-  duration_sec: number | null;
-  content_type: string;
-}
-
 export interface SoundEvent {
   start_time_sec: number;
   end_time_sec: number;
   label: string;
   confidence: number | null;
-}
-
-export interface SpeechSegment {
-  start_time_sec: number;
-  end_time_sec: number;
-  speaker: string | null;
-  speaker_name: string | null;
-  transcript: string;
-}
-
-export interface AudioInsights {
-  contains_speech: boolean | null;
-  detected_language: string | null;
-  primary_sound_environment: string | null;
-  situation_summary: string | null;
-  notable_events: string[];
-  keywords: string[];
-}
-
-export interface UsageMetadata {
-  audio_duration_sec: number | null;
-  services_used: string[];
-  processing_time_ms: number;
-}
-
-export interface AnalysisResponse {
-  recording: RecordingMetadata;
-  sound_events: SoundEvent[];
-  speech_segments: SpeechSegment[];
-  audio_insights: AudioInsights | null;
-  usage: UsageMetadata;
 }
 
 export type LiveChunkCollectionStatus =
@@ -47,6 +11,16 @@ export type LiveChunkCollectionStatus =
   | 'discarded_speech'
   | 'discarded_late';
 
+export interface LiveCurationProgress {
+  candidate_segment_count: number;
+  selected_segment_count: number;
+  rejected_repetitive_count: number;
+  rejected_class_balance_count: number;
+  rejected_session_budget_count: number;
+  invalid_audio_count: number;
+  write_error_count: number;
+}
+
 export interface LiveChunkAnalysisResponse {
   sequence_id: number;
   window_start_sec: number;
@@ -54,6 +28,7 @@ export interface LiveChunkAnalysisResponse {
   sound_events: SoundEvent[];
   processing_time_ms: number;
   collection_status?: LiveChunkCollectionStatus | null;
+  curation_progress?: LiveCurationProgress | null;
 }
 
 export interface CollectedSegmentSummary {
@@ -136,4 +111,14 @@ export interface GcsUploadFileProgress {
   file_status: 'uploaded' | 'existing';
   completed_file_count: number;
   total_file_count: number;
+}
+
+export interface RuntimeCapabilities {
+  gcs: boolean;
+}
+
+export interface RuntimeConfig {
+  collection_confidence_threshold: number;
+  api_token: string;
+  capabilities: RuntimeCapabilities;
 }
