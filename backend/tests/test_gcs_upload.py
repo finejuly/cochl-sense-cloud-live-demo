@@ -95,17 +95,17 @@ def test_uploads_complete_session_with_manifest_last_and_no_overwrites(tmp_path)
     result = upload_collected_session(
         collected_session_dir=session_dir,
         session_id="session-a",
-        bucket_name="example-gcs-bucket",
-        object_prefix="example-gcs-prefix",
+        bucket_name="test-bucket",
+        object_prefix="test-prefix",
         uploader_id="workstation-a",
         storage_client=client,
     )
 
-    assert client.bucket_names == ["example-gcs-bucket"]
+    assert client.bucket_names == ["test-bucket"]
     assert result.uploaded_file_count == 4
     assert result.existing_file_count == 0
     assert result.object_prefix == (
-        f"example-gcs-prefix/workstation-a/session-a/{result.snapshot_id}"
+        f"test-prefix/workstation-a/session-a/{result.snapshot_id}"
     )
     assert client.calls[-1] == f"{result.object_prefix}/manifest.json"
     assert set(client.store) == {
@@ -122,8 +122,8 @@ def test_uploads_complete_session_with_manifest_last_and_no_overwrites(tmp_path)
     repeated = upload_collected_session(
         collected_session_dir=session_dir,
         session_id="session-a",
-        bucket_name="example-gcs-bucket",
-        object_prefix="example-gcs-prefix",
+        bucket_name="test-bucket",
+        object_prefix="test-prefix",
         uploader_id="workstation-a",
         storage_client=client,
     )
@@ -142,8 +142,8 @@ def test_uploads_complete_session_with_manifest_last_and_no_overwrites(tmp_path)
     after_marker = upload_collected_session(
         collected_session_dir=session_dir,
         session_id="session-a",
-        bucket_name="example-gcs-bucket",
-        object_prefix="example-gcs-prefix",
+        bucket_name="test-bucket",
+        object_prefix="test-prefix",
         uploader_id="workstation-a",
         storage_client=client,
     )
