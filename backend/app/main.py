@@ -1387,7 +1387,7 @@ async def _run_provider_job_with_deadline(
         return await asyncio.wait_for(limited_run(), timeout=timeout_sec)
     except ProviderTimeoutError:
         raise
-    except TimeoutError as exc:
+    except (TimeoutError, asyncio.TimeoutError) as exc:
         raise ProviderTimeoutError(
             f"Cochl {kind} analysis exceeded the {timeout_sec:g} second deadline."
         ) from exc
@@ -1449,7 +1449,7 @@ async def _run_bounded_provider_job(
     provider_future.add_done_callback(finish)
     try:
         return await asyncio.wait_for(asyncio.shield(async_result), timeout=timeout_sec)
-    except TimeoutError as exc:
+    except (TimeoutError, asyncio.TimeoutError) as exc:
         async_result.cancel()
         raise ProviderTimeoutError(
             f"Cochl {kind} analysis exceeded the {timeout_sec:g} second deadline."

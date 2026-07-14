@@ -530,8 +530,6 @@ class SegmentCollector:
         # minimum length from leftover leading context.
         chunks = self._prepend_context(chunks)
 
-        self._candidate_index += 1
-        candidate_id = self._candidate_index
         start_sec = min(chunk.window_start_sec for chunk in chunks)
         end_sec = min(
             max(chunk.window_end_sec for chunk in chunks),
@@ -539,6 +537,8 @@ class SegmentCollector:
         )
         merge_result = _merge_chunk_audio(chunks, clip_end_sec=clip_end_sec)
         if merge_result.audio is None or merge_result.skipped_sequence_ids:
+            self._candidate_index += 1
+            candidate_id = self._candidate_index
             self._curator.record_invalid_audio(
                 candidate_id,
                 start_sec,
@@ -564,6 +564,20 @@ class SegmentCollector:
         duration_sec = len(merged.frames) / (
             merged.nchannels * merged.sampwidth * merged.framerate
         )
+        if duration_sec < self.policy.min_segment_sec:
+            logger.info(
+                "Discarding %.3f-second segment for session %s because it is "
+                "shorter than the %.3f-second minimum.",
+                duration_sec,
+                self.session_id,
+                self.policy.min_segment_sec,
+            )
+            self._delete_chunks(chunks)
+            self._write_session_summary(self._build_summary(ended=False))
+            return
+
+        self._candidate_index += 1
+        candidate_id = self._candidate_index
         observations = self._observed_events(
             chunks,
             consumed_sequence_ids=merge_result.consumed_sequence_ids,

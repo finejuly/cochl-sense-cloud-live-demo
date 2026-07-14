@@ -1157,7 +1157,7 @@ def test_analyze_live_chunk_collects_meaningful_audio_into_segments(
         responses = [
             post_live_chunk(client, "collect-test", sequence_id, start, end)
             for sequence_id, (start, end) in enumerate(
-                [(0, 2), (1, 3), (2, 4)], start=1
+                [(0, 2), (1, 3), (2, 4), (3, 5)], start=1
             )
         ]
         end_response = client.post(
@@ -1168,8 +1168,9 @@ def test_analyze_live_chunk_collects_meaningful_audio_into_segments(
         created_app.dependency_overrides.clear()
         created_app.state.provider_factory = None
 
-    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert [response.status_code for response in responses] == [200] * 4
     assert [response.json()["collection_status"] for response in responses] == [
+        "collected",
         "collected",
         "collected",
         "collected",
@@ -1179,8 +1180,8 @@ def test_analyze_live_chunk_collects_meaningful_audio_into_segments(
     assert end_response.status_code == 200
     assert summary["session_id"] == "collect-test"
     assert summary["segment_count"] == 1
-    assert summary["kept_chunk_count"] == 3
-    assert summary["total_collected_duration_sec"] == 4.0
+    assert summary["kept_chunk_count"] == 4
+    assert summary["total_collected_duration_sec"] == 5.0
     segment = summary["segments"][0]
     assert segment["labels"] == ["Keyboard"]
 
@@ -1189,7 +1190,7 @@ def test_analyze_live_chunk_collects_meaningful_audio_into_segments(
     metadata = json.loads(
         (collected_dir / segment["metadata_filename"]).read_text("utf-8")
     )
-    assert metadata["chunk_sequence_ids"] == [1, 2, 3]
+    assert metadata["chunk_sequence_ids"] == [1, 2, 3, 4]
     assert not (recordings_dir / "live" / "collect-test").exists()
 
 
@@ -1365,6 +1366,17 @@ def test_live_session_records_name_and_timestamps(tmp_path, monkeypatch):
             },
             files={"file": ("chunk.wav", make_wav_bytes(0, 2), "audio/wav")},
         )
+        for sequence_id, (start_sec, end_sec) in enumerate(
+            [(1, 3), (2, 4), (3, 5)],
+            start=2,
+        ):
+            post_live_chunk(
+                client,
+                "named-test",
+                sequence_id,
+                start_sec,
+                end_sec,
+            )
         end_response = client.post(
             "/api/live-session/end",
             data={"session_id": "named-test", "session_name": "사무실 소음"},
@@ -1414,7 +1426,17 @@ def test_collected_sessions_can_be_listed_served_and_deleted(tmp_path, monkeypat
     client = TestClient(created_app)
 
     try:
-        post_live_chunk(client, "manage-test", 1, 0, 2)
+        for sequence_id, (start_sec, end_sec) in enumerate(
+            [(0, 2), (1, 3), (2, 4), (3, 5)],
+            start=1,
+        ):
+            post_live_chunk(
+                client,
+                "manage-test",
+                sequence_id,
+                start_sec,
+                end_sec,
+            )
         client.post(
             "/api/live-session/end",
             data={"session_id": "manage-test", "session_name": "관리 테스트"},

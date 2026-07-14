@@ -110,6 +110,26 @@
 }
 
 - (void)webView:(WKWebView *)webView
+    runJavaScriptConfirmPanelWithMessage:(NSString *)message
+    initiatedByFrame:(WKFrameInfo *)frame
+    completionHandler:(void (^)(BOOL result))completionHandler {
+  if (!self.window || self.isQuitting) {
+    completionHandler(NO);
+    return;
+  }
+
+  NSAlert *alert = [[NSAlert alloc] init];
+  alert.alertStyle = NSAlertStyleWarning;
+  alert.messageText = @"확인";
+  alert.informativeText = message ?: @"";
+  [alert addButtonWithTitle:@"확인"];
+  [alert addButtonWithTitle:@"취소"];
+  [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse returnCode) {
+    completionHandler(returnCode == NSAlertFirstButtonReturn);
+  }];
+}
+
+- (void)webView:(WKWebView *)webView
     decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction
     decisionHandler:(void (^)(WKNavigationActionPolicy policy))decisionHandler {
   NSURL *url = navigationAction.request.URL;

@@ -77,6 +77,9 @@ def test_live_client_reuses_connection_and_returns_legacy_payload(
         response_sequence("session-1") + response_sequence("session-2")
     )
     factory_calls = []
+    monkeypatch.setattr(
+        "backend.app.cochl_live_client.time.monotonic", lambda: 100.0
+    )
     monkeypatch.setattr("backend.app.cochl_live_client.time.sleep", lambda _: None)
 
     def connection_factory(timeout):
