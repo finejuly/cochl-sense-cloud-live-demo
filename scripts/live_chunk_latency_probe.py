@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import os
 import sys
 import time
@@ -13,7 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,9 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from backend.app.cochl_provider import CochlProvider
+from backend.app.config import Settings
 
 DEFAULT_LOCAL_URL = "http://127.0.0.1:8000/api/analyze-live-chunk"
 
@@ -34,9 +36,11 @@ class ProbeRow:
     window_start_sec: float
     window_end_sec: float
     scheduled_at_iso: str
+    phase: str = "measurement"
     request_started_at_iso: str = ""
     response_received_at_iso: str = ""
     schedule_lag_ms: int | None = None
+    window_end_delay_ms: int | None = None
     request_ms: int | None = None
     backend_ms: int | None = None
     submit_ms: int | None = None
@@ -73,7 +77,8 @@ def main() -> int:
 
     print(
         "Starting probe: "
-        f"mode={args.mode} count={args.count} interval={args.interval_sec}s "
+        f"mode={args.mode} measured={args.count} warmup={args.warmup_count} "
+        f"interval={args.interval_sec}s "
         f"max_in_flight={args.max_in_flight} audio={audio_path}"
     )
     rows: list[ProbeRow] = []
@@ -94,14 +99,15 @@ def main() -> int:
         print(f"Wrote CSV: {csv_path.expanduser().resolve()}")
 
     print_summary(rows)
-    return 0 if not finish_error and all(row.status in {"OK", "SKIP"} for row in rows) else 1
+    return 0 if not finish_error and all(row.status == "OK" for row in rows) else 1
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Send the same live chunk WAV on a fixed schedule and record latency. "
-            "Use --mode direct to bypass the local demo, or --mode local to hit the local FastAPI endpoint."
+            "Use --mode direct for the same Cochl live-provider path as the backend, "
+            "or --mode local to hit the local FastAPI endpoint."
         )
     )
     parser.add_argument("audio_path", type=Path, help="WAV file to send repeatedly.")
@@ -109,10 +115,21 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=("direct", "local"),
         default="local",
-        help="direct calls Cochl SDK; local posts to /api/analyze-live-chunk.",
+        help="direct calls the backend's Cochl live provider; local posts to /api/analyze-live-chunk.",
     )
     parser.add_argument("--url", default=DEFAULT_LOCAL_URL, help="Local API URL for --mode local.")
-    parser.add_argument("--count", type=int, default=60, help="Number of scheduled chunks.")
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=60,
+        help="Number of measured chunks, excluding warmup chunks.",
+    )
+    parser.add_argument(
+        "--warmup-count",
+        type=int,
+        default=0,
+        help="Number of scheduled warmup chunks excluded from summary statistics.",
+    )
     parser.add_argument(
         "--interval-sec",
         type=float,
@@ -142,6 +159,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.count <= 0:
         parser.error("--count must be positive")
+    if args.warmup_count < 0:
+        parser.error("--warmup-count must be zero or positive")
     if args.interval_sec <= 0:
         parser.error("--interval-sec must be positive")
     if args.window_sec <= 0:
@@ -155,12 +174,13 @@ def parse_args() -> argparse.Namespace:
 
 def run_schedule(args: argparse.Namespace, runner: "ProbeRunner", session_id: str) -> list[ProbeRow]:
     rows: list[ProbeRow] = []
-    pending: dict[Future[ProbeRow], int] = {}
+    pending: dict[Future[ProbeRow], str] = {}
     start_monotonic = time.monotonic()
     start_wall = time.time()
+    total_count = args.warmup_count + args.count
 
     with ThreadPoolExecutor(max_workers=args.max_in_flight) as executor:
-        for sequence_id in range(1, args.count + 1):
+        for sequence_id in range(1, total_count + 1):
             scheduled_monotonic = start_monotonic + ((sequence_id - 1) * args.interval_sec)
             scheduled_wall = start_wall + ((sequence_id - 1) * args.interval_sec)
             sleep_until(scheduled_monotonic)
@@ -169,6 +189,7 @@ def run_schedule(args: argparse.Namespace, runner: "ProbeRunner", session_id: st
             window_start_sec = (sequence_id - 1) * args.interval_sec
             window_end_sec = window_start_sec + args.window_sec
             scheduled_at_iso = iso_from_epoch(scheduled_wall)
+            phase = "warmup" if sequence_id <= args.warmup_count else "measurement"
 
             in_flight = len(pending)
             if in_flight >= args.max_in_flight:
@@ -180,6 +201,7 @@ def run_schedule(args: argparse.Namespace, runner: "ProbeRunner", session_id: st
                     window_start_sec=window_start_sec,
                     window_end_sec=window_end_sec,
                     scheduled_at_iso=scheduled_at_iso,
+                    phase=phase,
                     in_flight_at_dispatch=in_flight,
                     error=f"max_in_flight={args.max_in_flight}",
                 )
@@ -197,23 +219,25 @@ def run_schedule(args: argparse.Namespace, runner: "ProbeRunner", session_id: st
                 scheduled_at_iso,
                 in_flight,
             )
-            pending[future] = sequence_id
+            pending[future] = phase
 
         for future in as_completed(pending):
             row = future.result()
+            row.phase = pending[future]
             rows.append(row)
             print_row(row)
 
     return rows
 
 
-def drain_completed(pending: dict[Future[ProbeRow], int], rows: list[ProbeRow]) -> None:
+def drain_completed(pending: dict[Future[ProbeRow], str], rows: list[ProbeRow]) -> None:
     if not pending:
         return
     done, _ = wait(pending, timeout=0)
     for future in done:
-        pending.pop(future, None)
+        phase = pending.pop(future)
         row = future.result()
+        row.phase = phase
         rows.append(row)
         print_row(row)
 
@@ -244,22 +268,12 @@ class ProbeRunner:
 class DirectCochlRunner(ProbeRunner):
     def __init__(self, audio_path: Path, timeout: float):
         self.audio_path = audio_path
-        self.timeout = timeout
-        configured_socket_timeout = float(
-            os.getenv("COCHL_SOCKET_TIMEOUT_SEC", "30")
-        )
-        if (
-            not math.isfinite(configured_socket_timeout)
-            or configured_socket_timeout <= 0
-        ):
-            raise SystemExit("COCHL_SOCKET_TIMEOUT_SEC must be finite and positive.")
-        self.socket_timeout = min(
-            timeout,
-            configured_socket_timeout,
-        )
-        self.project_key = os.getenv("COCHL_PROJECT_KEY", "")
-        if not self.project_key:
+        settings = Settings.from_env()
+        if not settings.cochl_project_key:
             raise SystemExit("COCHL_PROJECT_KEY is required for --mode direct.")
+        self.provider = CochlProvider(
+            replace(settings, cochl_live_timeout_sec=timeout)
+        )
 
     def send(
         self,
@@ -286,54 +300,25 @@ class DirectCochlRunner(ProbeRunner):
         row.request_started_at_iso = iso_from_epoch(request_start_wall)
         row.schedule_lag_ms = round_ms((request_start_wall - scheduled_wall) * 1000)
         try:
-            from cochl.sense import IntegratedApi, IntegratedApiOptions
-            from backend.app.cochl_provider import (
-                _get_completed_result_with_socket_timeout,
-                _remaining_socket_timeout,
-                _submit_with_socket_timeout,
-            )
-
-            api = IntegratedApi(project_key=self.project_key)
-            options = IntegratedApiOptions(
-                sound_event_detection=True,
-                speech_analysis=False,
-                audio_insights=False,
-            )
-            options.speaker_diarization = False
-            options.speaker_profile = False
-            deadline_at = time.monotonic() + self.timeout
-
-            submit_started = time.perf_counter()
-            submitted = _submit_with_socket_timeout(
-                api,
-                self.audio_path,
-                options,
-                _remaining_socket_timeout(deadline_at, self.socket_timeout),
-            )
-            row.submit_ms = round_ms((time.perf_counter() - submit_started) * 1000)
-
-            job_id = extract_job_id(submitted)
-            if not job_id:
-                raise RuntimeError("Cochl submission did not return a job id.")
-            wait_started = time.perf_counter()
-            result = _get_completed_result_with_socket_timeout(
-                api,
-                job_id,
-                _remaining_socket_timeout(deadline_at, self.socket_timeout),
-                deadline_at=deadline_at,
-            )
-            row.result_wait_ms = round_ms((time.perf_counter() - wait_started) * 1000)
+            result = self.provider.analyze_live_chunk(self.audio_path)
 
             response_wall = time.time()
             row.response_received_at_iso = iso_from_epoch(response_wall)
             row.request_ms = round_ms((time.perf_counter() - request_start) * 1000)
+            row.window_end_delay_ms = round_ms(
+                (response_wall - scheduled_wall) * 1000
+            )
             row.status = "OK"
             labels = labels_from_raw_result(result)
             row.event_count = len(labels)
             row.detected_labels = "; ".join(labels)
         except Exception as exc:
-            row.response_received_at_iso = iso_from_epoch(time.time())
+            response_wall = time.time()
+            row.response_received_at_iso = iso_from_epoch(response_wall)
             row.request_ms = round_ms((time.perf_counter() - request_start) * 1000)
+            row.window_end_delay_ms = round_ms(
+                (response_wall - scheduled_wall) * 1000
+            )
             row.error = str(exc)
         return row
 
@@ -404,6 +389,9 @@ class LocalApiRunner(ProbeRunner):
             response_wall = time.time()
             row.response_received_at_iso = iso_from_epoch(response_wall)
             row.request_ms = round_ms((time.perf_counter() - request_start) * 1000)
+            row.window_end_delay_ms = round_ms(
+                (response_wall - scheduled_wall) * 1000
+            )
 
             data = json.loads(payload.decode("utf-8"))
             row.status = "OK"
@@ -413,12 +401,20 @@ class LocalApiRunner(ProbeRunner):
             row.detected_labels = "; ".join(labels)
         except urllib.error.HTTPError as exc:
             row.status_code = exc.code
-            row.response_received_at_iso = iso_from_epoch(time.time())
+            response_wall = time.time()
+            row.response_received_at_iso = iso_from_epoch(response_wall)
             row.request_ms = round_ms((time.perf_counter() - request_start) * 1000)
+            row.window_end_delay_ms = round_ms(
+                (response_wall - scheduled_wall) * 1000
+            )
             row.error = decode_error_body(exc)
         except Exception as exc:
-            row.response_received_at_iso = iso_from_epoch(time.time())
+            response_wall = time.time()
+            row.response_received_at_iso = iso_from_epoch(response_wall)
             row.request_ms = round_ms((time.perf_counter() - request_start) * 1000)
+            row.window_end_delay_ms = round_ms(
+                (response_wall - scheduled_wall) * 1000
+            )
             row.error = str(exc)
         return row
 
@@ -480,11 +476,6 @@ def multipart_body(
         ]
     )
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
-
-
-def extract_job_id(response: dict[str, Any]) -> str:
-    value = response.get("job_id") or response.get("id")
-    return "" if value is None else str(value)
 
 
 def labels_from_raw_result(raw_result: dict[str, Any]) -> list[str]:
@@ -589,7 +580,8 @@ def print_row(row: ProbeRow) -> None:
         backend = f" backend={row.backend_ms}ms" if row.backend_ms is not None else ""
         submit = f" submit={row.submit_ms}ms wait={row.result_wait_ms}ms" if row.submit_ms is not None else ""
         print(
-            f"{row.sequence_id:04d} OK request={row.request_ms}ms{backend}{submit} "
+            f"{row.sequence_id:04d} {row.phase.upper()} OK "
+            f"window_end={row.window_end_delay_ms}ms request={row.request_ms}ms{backend}{submit} "
             f"in_flight={row.in_flight_at_dispatch} events={row.event_count}"
         )
     elif row.status == "SKIP":
@@ -602,12 +594,25 @@ def print_row(row: ProbeRow) -> None:
 
 
 def print_summary(rows: list[ProbeRow]) -> None:
-    ok_rows = [row for row in rows if row.status == "OK" and row.request_ms is not None]
-    errors = [row for row in rows if row.status == "ERROR"]
-    skips = [row for row in rows if row.status == "SKIP"]
+    measured_rows = [row for row in rows if row.phase == "measurement"]
+    warmup_rows = [row for row in rows if row.phase == "warmup"]
+    ok_rows = [
+        row
+        for row in measured_rows
+        if row.status == "OK" and row.request_ms is not None
+    ]
+    errors = [row for row in measured_rows if row.status == "ERROR"]
+    skips = [row for row in measured_rows if row.status == "SKIP"]
 
     print("\nSummary")
-    print(f"  scheduled={len(rows)} ok={len(ok_rows)} skip={len(skips)} error={len(errors)}")
+    print(
+        f"  measured={len(measured_rows)} warmup={len(warmup_rows)} "
+        f"ok={len(ok_rows)} skip={len(skips)} error={len(errors)}"
+    )
+    print_latency_stats(
+        "window_end_delay_ms",
+        [row.window_end_delay_ms for row in ok_rows],
+    )
     print_latency_stats("request_ms", [row.request_ms for row in ok_rows])
     print_latency_stats("backend_ms", [row.backend_ms for row in ok_rows])
     print_latency_stats("submit_ms", [row.submit_ms for row in ok_rows])
@@ -619,6 +624,18 @@ def print_summary(rows: list[ProbeRow]) -> None:
         print(f"  request_ms slope={request_slope:.1f} ms/request")
     if backend_slope is not None:
         print(f"  backend_ms slope={backend_slope:.1f} ms/request")
+
+    window_end_delays = [
+        row.window_end_delay_ms
+        for row in ok_rows
+        if row.window_end_delay_ms is not None
+    ]
+    if window_end_delays:
+        crossings = sum(value >= 2_000 for value in window_end_delays)
+        print(
+            f"  window_end_delay_ms >=2000ms: {crossings}/{len(window_end_delays)} "
+            f"({crossings / len(window_end_delays):.1%})"
+        )
 
 
 def print_latency_stats(name: str, values: list[int | None]) -> None:

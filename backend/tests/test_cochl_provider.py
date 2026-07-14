@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import pytest
 from cochl.sense import TimeoutException
 from cochl.sense.exception import CochlSenseException
 
+from backend.app.cochl_live_client import CochlLiveClientTimeoutError
 from backend.app.cochl_provider import (
     CochlProvider,
     CochlProviderTimeoutError,
@@ -132,6 +135,125 @@ def test_live_chunk_preserves_legacy_timeout_type(tmp_path):
 
     with pytest.raises(CochlProviderTimeoutError, match="timed out"):
         provider.analyze_live_chunk(audio_path)
+
+
+def test_live_chunk_uses_persistent_client_and_maps_results(tmp_path):
+    captured = {}
+
+    class FakePersistentClient:
+        @staticmethod
+        def predict(audio_path, *, timeout_sec):
+            captured.update(audio_path=audio_path, timeout_sec=timeout_sec)
+            return {
+                "session_id": "session-1",
+                "window_results": [
+                    {
+                        "start_time": 0,
+                        "end_time": 2,
+                        "sound_tags": [
+                            {"name": "Cough", "probability": 0.94},
+                        ],
+                    }
+                ],
+            }
+
+    def client_factory(project_key, socket_timeout_sec):
+        captured.update(
+            project_key=project_key,
+            socket_timeout_sec=socket_timeout_sec,
+        )
+        return FakePersistentClient()
+
+    audio_path = tmp_path / "chunk.wav"
+    audio_path.write_bytes(b"wav")
+    provider = CochlProvider(
+        Settings(
+            cochl_project_key="test-key",
+            cochl_live_timeout_sec=7.5,
+            cochl_socket_timeout_sec=3.0,
+            cochl_live_transport_compression=False,
+        ),
+        persistent_live_client_factory=client_factory,
+    )
+
+    result = provider.analyze_live_chunk(audio_path)
+
+    assert captured == {
+        "project_key": "test-key",
+        "socket_timeout_sec": 3.0,
+        "audio_path": audio_path,
+        "timeout_sec": 7.5,
+    }
+    assert result == {
+        "sound_event_detection": {
+            "status": "success",
+            "results": [
+                {
+                    "start_time_sec": 0,
+                    "end_time_sec": 2,
+                    "classes": [
+                        {"class": "Cough", "confidence": 0.94},
+                    ],
+                }
+            ],
+        }
+    }
+
+
+def test_live_chunk_preserves_persistent_timeout_type(tmp_path):
+    class FakePersistentClient:
+        @staticmethod
+        def predict(audio_path, *, timeout_sec):
+            raise CochlLiveClientTimeoutError("persistent request timed out")
+
+    audio_path = tmp_path / "chunk.wav"
+    audio_path.write_bytes(b"wav")
+    provider = CochlProvider(
+        Settings(
+            cochl_project_key="test-key",
+            cochl_live_transport_compression=False,
+        ),
+        persistent_live_client_factory=lambda project_key, socket_timeout_sec: (
+            FakePersistentClient()
+        ),
+    )
+
+    with pytest.raises(CochlProviderTimeoutError, match="persistent request timed out"):
+        provider.analyze_live_chunk(audio_path)
+
+
+def test_live_chunk_removes_optimized_transport_after_provider_call(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "chunk.wav"
+    source.write_bytes(b"captured-wav")
+    transport = tmp_path / ".chunk.cochl.ogg"
+    transport.write_bytes(b"transport-ogg")
+    captured = {}
+
+    class FakePersistentClient:
+        @staticmethod
+        def predict(audio_file_path, *, timeout_sec):
+            captured.update(path=Path(audio_file_path), timeout_sec=timeout_sec)
+            return {"session_id": "session-1", "window_results": []}
+
+    monkeypatch.setattr(
+        "backend.app.cochl_provider.prepare_live_audio_for_cochl",
+        lambda path: type("Prepared", (), {"path": transport})(),
+    )
+    provider = CochlProvider(
+        Settings(cochl_project_key="test-key"),
+        persistent_live_client_factory=lambda project_key, socket_timeout_sec: (
+            FakePersistentClient()
+        ),
+    )
+
+    provider.analyze_live_chunk(source)
+
+    assert captured["path"] == transport
+    assert captured["timeout_sec"] == 20.0
+    assert not transport.exists()
+    assert source.read_bytes() == b"captured-wav"
 
 
 def test_legacy_sound_event_results_rejects_malformed_payload():

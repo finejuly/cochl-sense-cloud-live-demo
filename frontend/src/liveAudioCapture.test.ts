@@ -85,6 +85,7 @@ describe('createLiveAudioCapture', () => {
       onSpectrogramFrame,
     });
 
+    expect(cleanup.captureStartedAtMs).toEqual(expect.any(Number));
     expect(context?.audioWorklet.addModule).toHaveBeenCalledWith('blob:worklet');
     expect(revokeSpy).toHaveBeenCalledWith('blob:worklet');
     worklet?.port.onmessage?.({ data: Float32Array.from([0, 1, 2, 3, 4, 5, 6, 7]) } as MessageEvent<Float32Array>);

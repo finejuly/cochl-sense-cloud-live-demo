@@ -13,7 +13,10 @@
 @property(nonatomic, strong) NSURL *projectRoot;
 @property(nonatomic, copy) NSString *serverScheme;
 @property(nonatomic, copy) NSString *serverHost;
+@property(nonatomic, strong) NSURL *serverURL;
 @property(nonatomic, assign) NSInteger serverPort;
+@property(nonatomic, assign) NSInteger frontendLoadAttempt;
+@property(nonatomic, assign) BOOL frontendReady;
 @property(nonatomic, assign) BOOL isQuitting;
 @property(nonatomic, assign) BOOL serverReportedError;
 @property(nonatomic, assign) BOOL compactWindow;
@@ -39,6 +42,7 @@
 - (void)applicationWillTerminate:(NSNotification *)notification {
   self.isQuitting = YES;
   [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"windowMode"];
+  [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"appReady"];
   [self stopServer];
 }
 
@@ -49,8 +53,34 @@
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-  self.statusLabel.hidden = YES;
-  self.webView.hidden = NO;
+  NSURL *url = webView.URL;
+  BOOL isServerOrigin = self.serverScheme.length > 0 &&
+    url.host.length > 0 &&
+    [url.scheme caseInsensitiveCompare:self.serverScheme] == NSOrderedSame &&
+    [url.host caseInsensitiveCompare:self.serverHost] == NSOrderedSame &&
+    (url.port ? url.port.integerValue : 80) == self.serverPort;
+  if (!isServerOrigin) {
+    return;
+  }
+  NSInteger completedAttempt = self.frontendLoadAttempt;
+  __weak typeof(self) weakSelf = self;
+  dispatch_after(
+    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+    dispatch_get_main_queue(),
+    ^{
+      AppDelegate *strongSelf = weakSelf;
+      if (!strongSelf || strongSelf.isQuitting || strongSelf.frontendReady ||
+          strongSelf.frontendLoadAttempt != completedAttempt) {
+        return;
+      }
+      if (strongSelf.frontendLoadAttempt < 3) {
+        [strongSelf loadFrontend];
+      } else {
+        [strongSelf showStatus:
+          @"Cochl.Sense Cloud Live Demo 화면을 불러오지 못했습니다. 앱을 닫고 다시 열어 주세요."];
+      }
+    }
+  );
 }
 
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
@@ -113,12 +143,12 @@
   configuration.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
   configuration.userContentController = [[WKUserContentController alloc] init];
   [configuration.userContentController addScriptMessageHandler:self name:@"windowMode"];
+  [configuration.userContentController addScriptMessageHandler:self name:@"appReady"];
 
   self.webView = [[WKWebView alloc] initWithFrame:NSZeroRect configuration:configuration];
   self.webView.navigationDelegate = self;
   self.webView.UIDelegate = self;
   self.webView.translatesAutoresizingMaskIntoConstraints = NO;
-  self.webView.hidden = YES;
 
   self.statusLabel = [NSTextField labelWithString:@"Cochl.Sense Cloud Live Demo를 시작하는 중..."];
   self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -158,6 +188,28 @@
 
 - (void)userContentController:(WKUserContentController *)userContentController
       didReceiveScriptMessage:(WKScriptMessage *)message {
+  if ([message.name isEqualToString:@"appReady"] && message.frameInfo.mainFrame &&
+      [message.body isKindOfClass:[NSDictionary class]]) {
+    id readyValue = ((NSDictionary *)message.body)[@"ready"];
+    if ([readyValue respondsToSelector:@selector(boolValue)] &&
+        [readyValue boolValue]) {
+      self.frontendReady = YES;
+      self.statusLabel.hidden = YES;
+      self.webView.hidden = NO;
+      __weak typeof(self) weakSelf = self;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.isQuitting) {
+          return;
+        }
+        [strongSelf.window.contentView setNeedsLayout:YES];
+        [strongSelf.window.contentView layoutSubtreeIfNeeded];
+        [strongSelf.webView setNeedsDisplay:YES];
+        [strongSelf.webView displayIfNeeded];
+      });
+    }
+    return;
+  }
   if (![message.name isEqualToString:@"windowMode"] ||
       ![message.body isKindOfClass:[NSDictionary class]]) {
     return;
@@ -210,6 +262,26 @@
   if (!NSEqualRects(self.expandedWindowFrame, NSZeroRect)) {
     [self.window setFrame:self.expandedWindowFrame display:YES animate:YES];
   }
+}
+
+- (void)loadFrontend {
+  if (!self.serverURL || self.isQuitting) {
+    return;
+  }
+  self.frontendLoadAttempt += 1;
+  self.frontendReady = NO;
+  if (self.frontendLoadAttempt == 1) {
+    [self showStatus:@"Cochl.Sense Cloud Live Demo를 여는 중..."];
+  } else {
+    [self showStatus:[NSString stringWithFormat:
+      @"Cochl.Sense Cloud Live Demo를 다시 여는 중... (%ld/3)",
+      (long)self.frontendLoadAttempt]];
+  }
+  NSURLRequest *request = [NSURLRequest
+    requestWithURL:self.serverURL
+       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+   timeoutInterval:15.0];
+  [self.webView loadRequest:request];
 }
 
 - (void)startServer {
@@ -289,8 +361,10 @@
       self.serverScheme = url.scheme;
       self.serverHost = url.host;
       self.serverPort = url.port ? url.port.integerValue : 80;
-      [self showStatus:@"Cochl.Sense Cloud Live Demo를 여는 중..."];
-      [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
+      self.serverURL = url;
+      self.frontendLoadAttempt = 0;
+      self.frontendReady = NO;
+      [self loadFrontend];
     }
   } else if ([line hasPrefix:@"Cochl.Sense Cloud Live Demo error:"]) {
     self.serverReportedError = YES;
@@ -299,7 +373,6 @@
 }
 
 - (void)showStatus:(NSString *)message {
-  self.webView.hidden = YES;
   self.statusLabel.hidden = NO;
   self.statusLabel.stringValue = message ?: @"";
 }

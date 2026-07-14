@@ -59,6 +59,7 @@ export interface LiveAudioCaptureOptions {
 }
 
 export type LiveAudioCaptureController = (() => void) & {
+  captureStartedAtMs: number;
   resume: () => Promise<void>;
   state: () => LiveAudioContextState;
 };
@@ -290,6 +291,7 @@ export async function createLiveAudioCapture(
   source.connect(analyser);
   analyser.connect(captureNode);
   captureNode.connect(context.destination);
+  const captureStartedAtMs = Date.now();
 
   const handleStateChange = () => options.onStateChange?.(
     context.state as LiveAudioContextState,
@@ -321,6 +323,7 @@ export async function createLiveAudioCapture(
     }
     void context.close().catch(() => undefined);
   }) as LiveAudioCaptureController;
+  cleanup.captureStartedAtMs = captureStartedAtMs;
   cleanup.resume = async () => {
     if (cleanedUp) {
       throw new Error('이미 종료된 오디오 캡처는 재개할 수 없습니다.');

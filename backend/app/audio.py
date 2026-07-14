@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -55,6 +56,25 @@ CONTENT_TYPE_EXTENSIONS = {
 }
 
 FFMPEG_TIMEOUT_SEC = 120
+LIVE_FFMPEG_TIMEOUT_SEC = 5
+LIVE_PROVIDER_VORBIS_QUALITY = 3
+FFMPEG_FALLBACK_PATHS = (
+    Path("/opt/homebrew/bin/ffmpeg"),
+    Path("/usr/local/bin/ffmpeg"),
+    Path("/opt/local/bin/ffmpeg"),
+)
+
+
+def find_ffmpeg_executable() -> str | None:
+    """Find ffmpeg even when a macOS app starts with LaunchServices' small PATH."""
+
+    discovered = shutil.which("ffmpeg")
+    if discovered:
+        return discovered
+    for candidate in FFMPEG_FALLBACK_PATHS:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 def normalized_content_type(content_type: str | None) -> str:
@@ -110,8 +130,22 @@ def prepare_audio_for_cochl(
     )
 
 
+def prepare_live_audio_for_cochl(source_path: Path) -> PreparedAudio:
+    """Build a small provider-only copy while preserving the captured WAV."""
+
+    converted_path = source_path.with_name(
+        f".{source_path.name}.{uuid4().hex}.cochl.ogg"
+    )
+    try:
+        convert_live_to_ogg(source_path, converted_path)
+    except AudioConversionError:
+        converted_path.unlink(missing_ok=True)
+        return PreparedAudio(path=source_path, content_type="audio/wav")
+    return PreparedAudio(path=converted_path, content_type="audio/ogg")
+
+
 def convert_to_wav(input_path: Path, output_path: Path) -> None:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg_executable()
     if not ffmpeg:
         raise AudioConversionError(
             "ffmpeg is required to convert this browser recording format to WAV."
@@ -140,8 +174,51 @@ def convert_to_wav(input_path: Path, output_path: Path) -> None:
         raise AudioConversionError("Failed to convert recording to WAV.") from exc
 
 
+def convert_live_to_ogg(input_path: Path, output_path: Path) -> None:
+    ffmpeg = find_ffmpeg_executable()
+    if not ffmpeg:
+        raise AudioConversionError(
+            "ffmpeg is unavailable; live analysis will use the original WAV."
+        )
+
+    try:
+        subprocess.run(
+            [
+                ffmpeg,
+                "-nostdin",
+                "-y",
+                "-i",
+                str(input_path),
+                "-ac",
+                "1",
+                "-c:a",
+                "libvorbis",
+                "-q:a",
+                str(LIVE_PROVIDER_VORBIS_QUALITY),
+                str(output_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=LIVE_FFMPEG_TIMEOUT_SEC,
+        )
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        raise AudioConversionError(
+            "Failed to create the optimized live-analysis transport."
+        ) from exc
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise AudioConversionError(
+            "Live-analysis transport conversion produced no audio."
+        )
+
+
 def convert_to_mp3(input_path: Path, output_path: Path) -> None:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg_executable()
     if not ffmpeg:
         raise AudioConversionError("ffmpeg is required to convert recording to MP3.")
 

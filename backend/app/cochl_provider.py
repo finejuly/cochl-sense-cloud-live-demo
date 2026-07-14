@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from pathlib import Path
 from time import monotonic
@@ -8,7 +9,15 @@ from typing import Any, Callable
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from backend.app.audio import prepare_live_audio_for_cochl
+from backend.app.cochl_live_client import (
+    CochlLiveClientError,
+    CochlLiveClientTimeoutError,
+    get_thread_live_client,
+)
 from backend.app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class CochlProviderTimeoutError(TimeoutError):
@@ -22,12 +31,14 @@ class CochlProvider:
         *,
         integrated_api_factory: Callable[[str], Any] | None = None,
         live_client_factory: Callable[[str], Any] | None = None,
+        persistent_live_client_factory: Callable[[str, float], Any] | None = None,
     ):
         if not settings.cochl_project_key:
             raise ValueError("COCHL_PROJECT_KEY is required.")
         self.settings = settings
         self._integrated_api_factory = integrated_api_factory
         self._live_client_factory = live_client_factory
+        self._persistent_live_client_factory = persistent_live_client_factory
 
     def analyze_file(self, path: Path) -> dict[str, Any]:
         if (
@@ -50,7 +61,60 @@ class CochlProvider:
         # positive two-second input, while the still-supported SED-only client
         # detects it. Keep multi-service recordings on IntegratedApi and use
         # the dedicated SED endpoint for live windows.
-        return self._analyze_sound_events(path)
+        analyze = (
+            self._analyze_sound_events
+            if self._live_client_factory is not None
+            or not self.settings.cochl_live_persistent_connections
+            else self._analyze_persistent_live_sound_events
+        )
+        if (
+            self._live_client_factory is not None
+            or not self.settings.cochl_live_transport_compression
+        ):
+            return analyze(path)
+
+        prepared = prepare_live_audio_for_cochl(path)
+        try:
+            return analyze(prepared.path)
+        finally:
+            if prepared.path != path:
+                try:
+                    prepared.path.unlink(missing_ok=True)
+                except OSError:
+                    logger.exception(
+                        "Could not remove live provider transport %s.", prepared.path
+                    )
+
+    def _analyze_persistent_live_sound_events(self, path: Path) -> dict[str, Any]:
+        try:
+            client = (
+                self._persistent_live_client_factory(
+                    self.settings.cochl_project_key,
+                    self.settings.cochl_socket_timeout_sec,
+                )
+                if self._persistent_live_client_factory is not None
+                else get_thread_live_client(
+                    self.settings.cochl_project_key,
+                    socket_timeout_sec=self.settings.cochl_socket_timeout_sec,
+                )
+            )
+            payload = _require_mapping(
+                client.predict(
+                    path,
+                    timeout_sec=self.settings.cochl_live_timeout_sec,
+                ),
+                stage="persistent live SED result",
+            )
+            return {
+                "sound_event_detection": {
+                    "status": "success",
+                    "results": _legacy_sound_event_results(payload),
+                }
+            }
+        except CochlLiveClientTimeoutError as exc:
+            raise CochlProviderTimeoutError(str(exc)) from exc
+        except (CochlLiveClientError, OSError, ValueError) as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def _analyze_sound_events(self, path: Path) -> dict[str, Any]:
         from cochl.sense import Client, TimeoutException

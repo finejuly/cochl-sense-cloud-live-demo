@@ -1,11 +1,17 @@
 from backend.app.audio import (
     COCHL_SUPPORTED_CONTENT_TYPES,
+    LIVE_FFMPEG_TIMEOUT_SEC,
+    LIVE_PROVIDER_VORBIS_QUALITY,
+    AudioConversionError,
     PreparedAudio,
     UploadTooLargeError,
+    convert_live_to_ogg,
     convert_to_mp3,
     extension_for_content_type,
+    find_ffmpeg_executable,
     is_cochl_supported_audio,
     prepare_audio_for_cochl,
+    prepare_live_audio_for_cochl,
     validate_upload_size,
 )
 
@@ -66,6 +72,18 @@ def test_prepare_audio_converts_unsupported_file(tmp_path, monkeypatch):
     assert converted_paths == [(source, prepared.path)]
 
 
+def test_find_ffmpeg_uses_executable_fallback_when_path_is_minimal(
+    tmp_path, monkeypatch
+):
+    fallback = tmp_path / "ffmpeg"
+    fallback.write_bytes(b"binary")
+    fallback.chmod(0o755)
+    monkeypatch.setattr("backend.app.audio.shutil.which", lambda name: None)
+    monkeypatch.setattr("backend.app.audio.FFMPEG_FALLBACK_PATHS", (fallback,))
+
+    assert find_ffmpeg_executable() == str(fallback)
+
+
 def test_prepare_audio_removes_partial_conversion_on_failure(tmp_path, monkeypatch):
     source = tmp_path / "clip.webm"
     source.write_bytes(b"fake")
@@ -89,6 +107,92 @@ def test_prepare_audio_removes_partial_conversion_on_failure(tmp_path, monkeypat
     assert attempted_output is not None
     assert not attempted_output.exists()
     assert source.read_bytes() == b"fake"
+
+
+def test_prepare_live_audio_creates_provider_only_ogg(tmp_path, monkeypatch):
+    source = tmp_path / "chunk.wav"
+    source.write_bytes(b"captured-wav")
+    converted_paths = []
+
+    def fake_convert(input_path, output_path):
+        converted_paths.append((input_path, output_path))
+        output_path.write_bytes(b"transport-ogg")
+
+    monkeypatch.setattr("backend.app.audio.convert_live_to_ogg", fake_convert)
+
+    prepared = prepare_live_audio_for_cochl(source)
+
+    assert prepared.path != source
+    assert prepared.path.name.startswith(".chunk.wav.")
+    assert prepared.path.name.endswith(".cochl.ogg")
+    assert prepared.content_type == "audio/ogg"
+    assert prepared.path.read_bytes() == b"transport-ogg"
+    assert source.read_bytes() == b"captured-wav"
+    assert converted_paths == [(source, prepared.path)]
+
+
+def test_prepare_live_audio_falls_back_and_removes_partial_ogg(tmp_path, monkeypatch):
+    source = tmp_path / "chunk.wav"
+    source.write_bytes(b"captured-wav")
+    attempted_output = None
+
+    def failing_conversion(input_path, output_path):
+        nonlocal attempted_output
+        attempted_output = output_path
+        output_path.write_bytes(b"partial")
+        raise AudioConversionError("ffmpeg unavailable")
+
+    monkeypatch.setattr("backend.app.audio.convert_live_to_ogg", failing_conversion)
+
+    prepared = prepare_live_audio_for_cochl(source)
+
+    assert prepared == PreparedAudio(path=source, content_type="audio/wav")
+    assert attempted_output is not None
+    assert not attempted_output.exists()
+    assert source.read_bytes() == b"captured-wav"
+
+
+def test_convert_live_to_ogg_preserves_sample_rate_and_uses_mono_vorbis(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "chunk.wav"
+    output = tmp_path / "chunk.ogg"
+    calls = []
+
+    monkeypatch.setattr("backend.app.audio.shutil.which", lambda name: "/usr/bin/ffmpeg")
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        output.write_bytes(b"ogg")
+
+    monkeypatch.setattr("backend.app.audio.subprocess.run", fake_run)
+
+    convert_live_to_ogg(source, output)
+
+    assert calls == [
+        (
+            [
+                "/usr/bin/ffmpeg",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(source),
+                "-ac",
+                "1",
+                "-c:a",
+                "libvorbis",
+                "-q:a",
+                str(LIVE_PROVIDER_VORBIS_QUALITY),
+                str(output),
+            ],
+            {
+                "check": True,
+                "capture_output": True,
+                "text": True,
+                "timeout": LIVE_FFMPEG_TIMEOUT_SEC,
+            },
+        )
+    ]
 
 
 def test_convert_to_mp3_uses_44100_hz_mono_128_kbps(tmp_path, monkeypatch):

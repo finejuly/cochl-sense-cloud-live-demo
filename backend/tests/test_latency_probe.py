@@ -3,9 +3,12 @@ from urllib.parse import parse_qs
 import pytest
 
 from scripts.live_chunk_latency_probe import (
+    DirectCochlRunner,
     LocalApiRunner,
+    ProbeRow,
     labels_from_raw_result,
     live_session_end_url,
+    print_summary,
 )
 
 
@@ -57,6 +60,49 @@ def test_local_probe_finalizes_its_live_session(tmp_path, monkeypatch):
     }
 
 
+def test_direct_probe_uses_backend_live_provider(tmp_path, monkeypatch):
+    wav_path = tmp_path / "chunk.wav"
+    wav_path.write_bytes(b"wav")
+    captured = {}
+
+    class FakeProvider:
+        def __init__(self, settings):
+            captured["timeout"] = settings.cochl_live_timeout_sec
+
+        def analyze_live_chunk(self, audio_path):
+            captured["audio_path"] = audio_path
+            return {
+                "sound_event_detection": {
+                    "status": "success",
+                    "results": [
+                        {
+                            "classes": [
+                                {"class": "Cough", "confidence": 0.95},
+                            ]
+                        }
+                    ],
+                }
+            }
+
+    monkeypatch.setenv("COCHL_PROJECT_KEY", "test-key")
+    monkeypatch.setattr("scripts.live_chunk_latency_probe.CochlProvider", FakeProvider)
+    runner = DirectCochlRunner(wav_path, timeout=7.5)
+
+    row = runner.send(
+        "probe-session",
+        1,
+        0.0,
+        2.0,
+        100.0,
+        "scheduled",
+        0,
+    )
+
+    assert row.status == "OK"
+    assert row.detected_labels == "Cough 95%"
+    assert captured == {"timeout": 7.5, "audio_path": wav_path}
+
+
 def test_direct_probe_reads_both_documented_sound_event_keys():
     payload = {
         "status": "success",
@@ -82,3 +128,38 @@ def test_direct_probe_rejects_missing_or_malformed_service_payload():
         labels_from_raw_result({})
     with pytest.raises(ValueError, match="invalid"):
         labels_from_raw_result({"sound_event_detection": {"results": {}}})
+
+
+def test_probe_summary_excludes_warmup_and_reports_window_end_gate(capsys):
+    common = {
+        "mode": "local",
+        "session_id": "probe-session",
+        "status": "OK",
+        "window_start_sec": 0.0,
+        "window_end_sec": 2.0,
+        "scheduled_at_iso": "scheduled",
+    }
+    rows = [
+        ProbeRow(
+            **common,
+            sequence_id=1,
+            phase="warmup",
+            request_ms=9_000,
+            window_end_delay_ms=9_000,
+        ),
+        ProbeRow(
+            **common,
+            sequence_id=2,
+            phase="measurement",
+            request_ms=750,
+            window_end_delay_ms=760,
+        ),
+    ]
+
+    print_summary(rows)
+
+    output = capsys.readouterr().out
+    assert "measured=1 warmup=1 ok=1 skip=0 error=0" in output
+    assert "window_end_delay_ms: min=760ms p50=760ms p95=760ms max=760ms" in output
+    assert "window_end_delay_ms >=2000ms: 0/1 (0.0%)" in output
+    assert "9000ms" not in output
