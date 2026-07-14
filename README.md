@@ -53,7 +53,9 @@
 
 ### 1. 설치
 
-프로젝트 루트에서 실행합니다.
+프로젝트 루트에서 운영체제에 맞는 명령을 실행합니다.
+
+#### macOS/Linux
 
 ```bash
 python3 -m venv .venv
@@ -69,6 +71,24 @@ npm ci
 cd ..
 ```
 
+#### Windows (PowerShell)
+
+Windows에서는 macOS용 `.app` 대신 브라우저로 실행합니다. 아래 명령은 가상 환경을 활성화하지 않고 실행하므로 PowerShell 실행 정책을 변경할 필요가 없습니다.
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -c backend/constraints.txt -e "backend[dev]"
+
+Copy-Item .env.example .env
+
+Set-Location frontend
+npm ci
+Set-Location ..
+```
+
+`py` 명령을 찾을 수 없다면 첫 줄의 `py -3`을 `python`으로 바꾸세요. Node.js 버전 관리자를 사용한다면 `.nvmrc`에 적힌 버전을 설치해 사용하고, 그렇지 않다면 Node.js 20.19 이상이 설치되어 있는지 `node --version`으로 확인하세요. `ffmpeg`를 설치했다면 `ffmpeg -version`이 PowerShell에서 실행되도록 PATH에 등록하세요.
+
 생성된 `.env`에서 `COCHL_PROJECT_KEY`에 발급받은 키를 넣으세요. `.env`와 인증 파일은 Git에 커밋하지 마세요. 설정을 바꾼 뒤에는 백엔드를 다시 시작해야 합니다.
 
 ### 2. 실행
@@ -82,7 +102,7 @@ open CochlSenseCloudLiveDemo.app
 
 이 앱은 현재 저장소의 `.venv`, `.env`, 백엔드 코드와 빌드된 프런트엔드를 사용하는 개발용 래퍼입니다. 다른 컴퓨터에 그대로 배포하는 독립 실행형 앱은 아닙니다.
 
-#### 브라우저에서 실행
+#### macOS/Linux에서 브라우저로 실행
 
 터미널 1 — 백엔드:
 
@@ -99,6 +119,25 @@ npm run dev
 ```
 
 브라우저에서 `http://127.0.0.1:5173`을 열고 마이크 권한을 허용하세요.
+
+#### Windows에서 브라우저로 실행
+
+PowerShell 창 두 개를 열고 프로젝트 루트에서 각각 실행합니다.
+
+PowerShell 1 — 백엔드:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+PowerShell 2 — 프런트엔드:
+
+```powershell
+Set-Location frontend
+npm run dev
+```
+
+Chrome 또는 Edge에서 `http://127.0.0.1:5173`을 열고 마이크 권한을 허용하세요. Windows용 독립 실행형 `.exe`나 설치 프로그램은 현재 제공하지 않습니다.
 
 ## 사용 방법
 
