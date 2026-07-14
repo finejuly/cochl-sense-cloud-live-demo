@@ -680,9 +680,10 @@ def test_short_signal_gets_context_on_both_sides(tmp_path):
     assert summary.discarded_silent_chunk_count == 2
 
 
-def test_context_padding_never_crosses_a_speech_boundary(tmp_path):
+def test_short_segment_is_discarded_instead_of_crossing_a_speech_boundary(tmp_path):
     chunks_dir = tmp_path / "live"
-    collector = SegmentCollector("session-a", tmp_path / "collected", PADDING_POLICY)
+    output_dir = tmp_path / "collected"
+    collector = SegmentCollector("session-a", output_dir, PADDING_POLICY)
 
     add_chunk(collector, chunks_dir, 1, 0, 2, [])
     _, speech_path = add_chunk(collector, chunks_dir, 2, 1, 3, [event("Speech", 0.9)])
@@ -691,14 +692,37 @@ def test_context_padding_never_crosses_a_speech_boundary(tmp_path):
 
     summary = collector.end_session()
 
-    assert summary.segment_count == 1
-    segment = summary.segments[0]
-    # Pre-roll may only reach back to the silent chunk after the speech chunk.
-    assert segment.start_sec == 2.0
-    assert segment.end_sec == 5.0
+    # The only safe pre-roll starts after the speech chunk, leaving just three
+    # seconds. The segment must be discarded instead of crossing the privacy
+    # boundary or violating the configured five-second minimum.
+    assert summary.segment_count == 0
+    assert summary.candidate_segment_count == 0
+    assert not list(output_dir.glob("segment-*"))
     assert not speech_path.exists()
     assert summary.discarded_speech_chunk_count == 1
     assert summary.discarded_silent_chunk_count == 1
+
+
+def test_short_segment_is_discarded_at_session_end(tmp_path):
+    chunks_dir = tmp_path / "live"
+    output_dir = tmp_path / "collected"
+    collector = SegmentCollector("session-a", output_dir, PADDING_POLICY)
+
+    _, chunk_path = add_chunk(
+        collector,
+        chunks_dir,
+        1,
+        0,
+        2,
+        [event("Glass_break", 0.9)],
+    )
+
+    summary = collector.end_session()
+
+    assert summary.segment_count == 0
+    assert summary.candidate_segment_count == 0
+    assert not list(output_dir.glob("segment-*"))
+    assert not chunk_path.exists()
 
 
 def test_sustained_silence_finalizes_the_segment_in_real_time(tmp_path):
