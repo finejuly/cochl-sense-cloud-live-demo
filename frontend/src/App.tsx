@@ -158,8 +158,11 @@ interface LiveLatencySample {
   eventDelayMs: number;
   requestMs: number;
   backendMs: number;
+  backendTotalMs: number;
   windowEndDelayMs: number;
   windowCallbackDelayMs: number;
+  captureClockDriftMs: number;
+  encodeMs: number;
 }
 
 export default function App() {
@@ -206,6 +209,9 @@ export default function App() {
   const liveCleanupRef = useRef<LiveAudioCaptureController | null>(null);
   const liveInFlightRef = useRef(0);
   const liveSequenceRef = useRef(0);
+  // UI rows stay bounded to one hour, but this O(1)-updated map preserves one
+  // compact final row per sequence for the post-session diagnostic CSV.
+  const liveChunkLogRef = useRef<Map<number, LiveChunkRecord>>(new Map());
   const liveSessionTokenRef = useRef('');
   const livePendingRequestsRef = useRef<Map<string, Set<Promise<void>>>>(new Map());
   const liveAbortControllersRef = useRef<Map<string, Set<AbortController>>>(new Map());
@@ -485,6 +491,7 @@ export default function App() {
     setLiveViewportStartSec(0);
     setLiveAutoFollow(true);
     setLiveChunkRecords([]);
+    liveChunkLogRef.current.clear();
     setLiveChunkSnapshotMs(Date.now());
     setLiveCollectionCounts(emptyLiveCollectionCounts());
     setLiveCurationProgress(null);
@@ -667,6 +674,7 @@ export default function App() {
   }
 
   function upsertLiveChunkState(next: LiveChunkRecord) {
+    liveChunkLogRef.current.set(next.sequenceId, next);
     setLiveChunkRecords((current) => retainRecentLiveChunkRecords(
       upsertLiveChunkRecord(current, next),
       LIVE_UI_HISTORY_RETENTION_SEC,
@@ -683,6 +691,7 @@ export default function App() {
       return;
     }
 
+    const windowEmittedAtMs = Date.now();
     const sequenceId = liveSequenceRef.current + 1;
     liveSequenceRef.current = sequenceId;
     const recordInput = {
@@ -691,6 +700,8 @@ export default function App() {
       recordingStartedAtMs,
       windowStartSec: window.windowStartSec,
       windowEndSec: window.windowEndSec,
+      windowEmittedAtMs,
+      inFlightAtDispatch: liveInFlightRef.current,
     };
 
     if (liveInFlightRef.current >= LIVE_MAX_IN_FLIGHT) {
@@ -702,7 +713,12 @@ export default function App() {
     const pendingRecord = createPendingLiveChunkRecord(recordInput);
     upsertLiveChunkState(pendingRecord);
     liveInFlightRef.current += 1;
-    const pendingRequest = submitLiveWindow(window, liveSessionToken, pendingRecord, Date.now());
+    const pendingRequest = submitLiveWindow(
+      window,
+      liveSessionToken,
+      pendingRecord,
+      windowEmittedAtMs,
+    );
     const sessionRequests = livePendingRequestsRef.current.get(liveSessionToken) ?? new Set();
     sessionRequests.add(pendingRequest);
     livePendingRequestsRef.current.set(liveSessionToken, sessionRequests);
@@ -803,6 +819,7 @@ export default function App() {
             requestStartedAtMs,
             responseReceivedAtMs,
             windowEmittedAtMs,
+            windowEndSec: currentRecord.windowEndSec,
           });
         });
       } else {
@@ -837,12 +854,14 @@ export default function App() {
     requestStartedAtMs,
     responseReceivedAtMs,
     windowEmittedAtMs,
+    windowEndSec,
   }: {
     event: SoundEvent;
     response: Awaited<ReturnType<typeof analyzeLiveChunk>>;
     requestStartedAtMs: number;
     responseReceivedAtMs: number;
     windowEmittedAtMs: number;
+    windowEndSec: number;
   }) {
     const recordingStartedAtMs = startedAtRef.current;
     if (recordingStartedAtMs === null) {
@@ -850,17 +869,26 @@ export default function App() {
     }
 
     const markerCreatedAtMs = Date.now();
+    const captureClockDriftMs = Math.round(
+      windowEmittedAtMs - (recordingStartedAtMs + windowEndSec * 1000),
+    );
+    const windowCallbackDelayMs = positiveRoundedMs(markerCreatedAtMs - windowEmittedAtMs);
     const sample: LiveLatencySample = {
       label: event.label,
       sequenceId: response.sequence_id,
       confidence: event.confidence,
       eventStartSec: event.start_time_sec,
       eventEndSec: event.end_time_sec,
-      eventDelayMs: positiveRoundedMs(markerCreatedAtMs - (recordingStartedAtMs + event.start_time_sec * 1000)),
+      eventDelayMs: positiveRoundedMs(
+        windowCallbackDelayMs + (windowEndSec - event.start_time_sec) * 1000,
+      ),
       requestMs: positiveRoundedMs(responseReceivedAtMs - requestStartedAtMs),
       backendMs: positiveRoundedMs(response.processing_time_ms),
-      windowEndDelayMs: positiveRoundedMs(markerCreatedAtMs - (recordingStartedAtMs + response.window_end_sec * 1000)),
-      windowCallbackDelayMs: positiveRoundedMs(markerCreatedAtMs - windowEmittedAtMs),
+      backendTotalMs: positiveRoundedMs(response.timings?.total_ms ?? response.processing_time_ms),
+      windowEndDelayMs: windowCallbackDelayMs,
+      windowCallbackDelayMs,
+      captureClockDriftMs,
+      encodeMs: positiveRoundedMs(requestStartedAtMs - windowEmittedAtMs),
     };
     setLiveLatencySample((current) => {
       if (!current) {
@@ -906,7 +934,7 @@ export default function App() {
 
     try {
       anchor.href = objectUrl;
-      anchor.download = liveChunkCsvFilename(liveChunkRecords[0]?.sessionId ?? 'session');
+      anchor.download = liveChunkCsvFilename(fullLiveChunkLog()[0]?.sessionId ?? 'session');
       anchor.target = '_blank';
       anchor.rel = 'noopener';
       document.body.append(anchor);
@@ -928,9 +956,13 @@ export default function App() {
   }
 
   function createLiveChunkCsvObjectUrl(): string {
-    const csv = liveChunkRecordsToCsv(liveChunkRecords, Date.now());
+    const csv = liveChunkRecordsToCsv(fullLiveChunkLog(), Date.now());
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
     return URL.createObjectURL(blob);
+  }
+
+  function fullLiveChunkLog(): LiveChunkRecord[] {
+    return [...liveChunkLogRef.current.values()];
   }
 
   function scheduleObjectUrlRevoke(objectUrl: string) {
@@ -943,7 +975,7 @@ export default function App() {
     && (status === 'idle' || status === 'error' || status === 'complete');
   const canComplete = status === 'recording';
   const canStopAndKeep = status === 'recording';
-  const canDownloadCsv = status === 'complete' && liveChunkRecords.length > 0;
+  const canDownloadCsv = status === 'complete' && liveChunkLogRef.current.size > 0;
   const hasCollectionActivity =
     liveCollectionCounts.collected > 0 ||
     liveCollectionCounts.discardedSilent > 0 ||
@@ -1068,7 +1100,7 @@ export default function App() {
           </div>
           <div className="meta-row">
             <span>중요 구간만 자동 저장</span>
-            <span>원본 저장 안 함 · 화면 이력 최근 60분</span>
+            <span>원본 저장 안 함 · 화면 이력 최근 60분 · 진단 CSV 전체 세션</span>
             <span>입력 48 kHz · 모노 · 음성 보정 끔</span>
             <span>수집 기준 신뢰도 {Math.round(liveConfidenceThreshold * 100)}%</span>
             {(status === 'recording' || hasCollectionActivity) && (
@@ -1291,16 +1323,24 @@ function formatLiveLatencyLabel(sample: LiveLatencySample): string {
 function formatLiveLatencyTitle(sample: LiveLatencySample): string {
   return [
     `이벤트 시작->마커 ${formatLatency(sample.eventDelayMs)}`,
-    `윈도우 종료->마커 ${formatLatency(sample.windowEndDelayMs)}`,
+    `윈도우 종료(콜백 기준)->마커 ${formatLatency(sample.windowEndDelayMs)}`,
     `요청 왕복 ${formatLatency(sample.requestMs)}`,
-    `서버 ${formatLatency(sample.backendMs)}`,
+    `서버 분석 ${formatLatency(sample.backendMs)}`,
+    `서버 전체 ${formatLatency(sample.backendTotalMs)}`,
+    `WAV 인코딩 ${formatLatency(sample.encodeMs)}`,
     `윈도우 콜백->마커 ${formatLatency(sample.windowCallbackDelayMs)}`,
+    `캡처 시계 차이 ${formatSignedLatency(sample.captureClockDriftMs)}`,
     `sequence ${sample.sequenceId}`,
   ].join(', ');
 }
 
 function formatLatency(milliseconds: number): string {
   return `${(milliseconds / 1000).toFixed(2)}초`;
+}
+
+function formatSignedLatency(milliseconds: number): string {
+  const sign = milliseconds >= 0 ? '+' : '-';
+  return `${sign}${formatLatency(Math.abs(milliseconds))}`;
 }
 
 function CollectionSummaryPanel({ summary }: { summary: LiveSessionEndResponse }) {

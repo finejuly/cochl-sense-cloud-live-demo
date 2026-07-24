@@ -7,6 +7,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 from backend.app.audio import prepare_live_audio_for_cochl
@@ -299,9 +300,21 @@ def _get_completed_result_with_socket_timeout(
     deadline_at: float | None = None,
 ):
     request = api.create_event_stream_request(job_id)
+    request_url = getattr(request, "full_url", request)
+    parsed_url = urlsplit(request_url) if isinstance(request_url, str) else None
+    if (
+        parsed_url is None
+        or parsed_url.scheme.lower() != "https"
+        or not parsed_url.hostname
+    ):
+        raise RuntimeError("Cochl event stream URL must use HTTPS.")
     current_event: str | None = None
 
-    with urlopen(request, timeout=timeout) as response:
+    # The request URL is restricted to HTTPS above.
+    with urlopen(  # nosec B310
+        request,
+        timeout=timeout,
+    ) as response:
         for raw_line in response:
             if deadline_at is not None and monotonic() >= deadline_at:
                 raise TimeoutError("Cochl analysis deadline exceeded.")

@@ -19,13 +19,18 @@ import type { LiveChunkAnalysisResponse, SoundEvent } from './types';
 const RECORDING_STARTED_AT_MS = Date.UTC(2026, 0, 1, 0, 0, 0);
 
 function pending(overrides: Partial<LiveChunkRecord> = {}): LiveChunkRecord {
+  const windowStartSec = overrides.windowStartSec ?? 0;
+  const windowEndSec = overrides.windowEndSec ?? 2;
   return {
     ...createPendingLiveChunkRecord({
       sessionId: 'session:1',
       sequenceId: 1,
       recordingStartedAtMs: RECORDING_STARTED_AT_MS,
-      windowStartSec: 0,
-      windowEndSec: 2,
+      windowStartSec,
+      windowEndSec,
+      windowEmittedAtMs: overrides.windowEmittedAtMs
+        ?? RECORDING_STARTED_AT_MS + windowEndSec * 1000,
+      inFlightAtDispatch: overrides.inFlightAtDispatch ?? 0,
     }),
     ...overrides,
   };
@@ -145,6 +150,8 @@ describe('live chunk record lifecycle', () => {
       recordingStartedAtMs: RECORDING_STARTED_AT_MS,
       windowStartSec: 6,
       windowEndSec: 8,
+      windowEmittedAtMs: RECORDING_STARTED_AT_MS + 8000,
+      inFlightAtDispatch: 10,
     });
 
     expect(failed).toMatchObject({
@@ -175,6 +182,8 @@ describe('live chunk record lifecycle', () => {
       recordingStartedAtMs: first.recordingStartedAtMs,
       windowStartSec: first.windowStartSec,
       windowEndSec: first.windowEndSec,
+      windowEmittedAtMs: first.windowEmittedAtMs,
+      inFlightAtDispatch: first.inFlightAtDispatch,
     });
 
     const records = upsertLiveChunkRecord(
@@ -196,6 +205,8 @@ describe('live chunk record lifecycle', () => {
         recordingStartedAtMs: RECORDING_STARTED_AT_MS,
         windowStartSec,
         windowEndSec,
+        windowEmittedAtMs: RECORDING_STARTED_AT_MS + windowEndSec * 1000,
+        inFlightAtDispatch: 0,
       })
     );
     const records = [
@@ -271,6 +282,41 @@ describe('live chunk render helpers', () => {
     expect(rendered[0].delayTicks.map((tick) => tick.seconds)).toEqual([1, 2, 3]);
   });
 
+  it('keeps accumulated capture-clock drift out of the response-delay tail', () => {
+    const windowEndSec = 8 * 60 * 60 + 2;
+    const windowEmittedAtMs = RECORDING_STARTED_AT_MS + windowEndSec * 1000 + 4000;
+    const requested = markLiveChunkRequestStarted(
+      pending({
+        sequenceId: 28_801,
+        windowStartSec: windowEndSec - 2,
+        windowEndSec,
+        windowEmittedAtMs,
+      }),
+      windowEmittedAtMs + 25,
+    );
+    const completed = completeLiveChunkRecord(
+      requested,
+      response(28_801, []),
+      0.5,
+      windowEmittedAtMs + 1025,
+    );
+
+    expect(completed).toMatchObject({
+      captureClockDriftMs: 4000,
+      encodeMs: 25,
+      requestMs: 1000,
+      windowEndDelayMs: 1025,
+    });
+    expect(latestLiveChunkTailEndSec([completed], windowEmittedAtMs + 10_000)).toBe(
+      windowEndSec + 1.025,
+    );
+    expect(renderLiveChunkRecords(
+      [completed],
+      { startSec: windowEndSec - 2, endSec: windowEndSec + 3 },
+      windowEmittedAtMs + 10_000,
+    )[0].ariaLabel).toContain('캡처 시계 차이 +4.00초');
+  });
+
   it('clips delay ticks to the visible viewport including exact boundaries', () => {
     const rendered = renderLiveChunkRecords(
       [pending({ windowStartSec: 10, windowEndSec: 12 })],
@@ -308,6 +354,8 @@ describe('live chunk render helpers', () => {
       recordingStartedAtMs: RECORDING_STARTED_AT_MS,
       windowStartSec: 0,
       windowEndSec: 2,
+      windowEmittedAtMs: RECORDING_STARTED_AT_MS + 2000,
+      inFlightAtDispatch: 0,
     });
 
     const rendered = renderLiveChunkRecords(
@@ -421,7 +469,15 @@ describe('live chunk CSV helpers', () => {
   it('serializes rows, pending delay snapshots, and escaped CSV fields', () => {
     const detected = completeLiveChunkRecord(
       markLiveChunkRequestStarted(pending({ sequenceId: 2 }), RECORDING_STARTED_AT_MS + 100),
-      response(2, [{ label: 'Door, "bell"', confidence: 0.91 }]),
+      response(2, [{ label: 'Door, "bell"', confidence: 0.91 }], {
+        timings: {
+          upload_ms: 4,
+          provider_ms: 30,
+          normalization_ms: 1,
+          collection_ms: 7,
+          total_ms: 42,
+        },
+      }),
       0.5,
       RECORDING_STARTED_AT_MS + 2600,
     );
@@ -437,6 +493,8 @@ describe('live chunk CSV helpers', () => {
       recordingStartedAtMs: RECORDING_STARTED_AT_MS,
       windowStartSec: 3,
       windowEndSec: 5,
+      windowEmittedAtMs: RECORDING_STARTED_AT_MS + 5000,
+      inFlightAtDispatch: 10,
     });
 
     const csv = liveChunkRecordsToCsv(
@@ -445,12 +503,13 @@ describe('live chunk CSV helpers', () => {
     );
 
     expect(csv.split('\n')[0]).toBe(
-      'session_id,sequence_id,status,window_start_sec,window_end_sec,request_started_at_iso,response_received_at_iso,request_ms,backend_ms,window_end_delay_ms,event_count,detected_labels,error',
+      'session_id,sequence_id,status,window_start_sec,window_end_sec,window_emitted_at_iso,capture_clock_drift_ms,in_flight_at_dispatch,request_started_at_iso,response_received_at_iso,encode_ms,request_ms,backend_ms,backend_upload_ms,backend_provider_ms,backend_normalization_ms,backend_collection_ms,backend_total_ms,window_end_delay_ms,event_count,detected_labels,error',
     );
-    expect(csv).toContain('session:1,1,PENDING,0,2,,,,,2100,0,,');
-    expect(csv).toContain('session:1,2,DETECTED,0,2,2026-01-01T00:00:00.100Z,2026-01-01T00:00:02.600Z,2500,42,600,1,"Door, ""bell"" 91%",');
-    expect(csv).toContain('session:1,3,FAIL,0,2,2026-01-01T00:00:00.100Z,2026-01-01T00:00:02.900Z,2800,,900,0,,"line one\nline two"');
-    expect(csv).toContain('session:1,4,SKIP,3,5,,,,,,0,,');
+    expect(csv).toContain('session:1,1,PENDING,0,2,2026-01-01T00:00:02.000Z,0,0,');
+    expect(csv).toContain(',,,,2100,0,,');
+    expect(csv).toContain('session:1,2,DETECTED,0,2,2026-01-01T00:00:02.000Z,0,0,2026-01-01T00:00:00.100Z,2026-01-01T00:00:02.600Z,0,2500,42,4,30,1,7,42,600,1,"Door, ""bell"" 91%",');
+    expect(csv).toContain('session:1,3,FAIL,0,2,2026-01-01T00:00:02.000Z,0,0,2026-01-01T00:00:00.100Z,2026-01-01T00:00:02.900Z,0,2800,,,,,,,900,0,,"line one\nline two"');
+    expect(csv).toContain('session:1,4,SKIP,3,5,2026-01-01T00:00:05.000Z,0,10,');
   });
 
   it('sanitizes CSV filenames', () => {

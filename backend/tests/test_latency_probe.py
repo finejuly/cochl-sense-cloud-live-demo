@@ -60,6 +60,22 @@ def test_local_probe_finalizes_its_live_session(tmp_path, monkeypatch):
     }
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///tmp/analyze-live-chunk",
+        "http:///api/analyze-live-chunk",
+        "http://user:password@127.0.0.1:8000/api/analyze-live-chunk",
+    ],
+)
+def test_local_probe_rejects_unsafe_url(tmp_path, url):
+    wav_path = tmp_path / "chunk.wav"
+    wav_path.write_bytes(b"wav")
+
+    with pytest.raises(ValueError, match=r"must use HTTP\(S\)"):
+        LocalApiRunner(wav_path, url, timeout=7)
+
+
 def test_direct_probe_uses_backend_live_provider(tmp_path, monkeypatch):
     wav_path = tmp_path / "chunk.wav"
     wav_path.write_bytes(b"wav")

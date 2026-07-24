@@ -21,12 +21,21 @@ export interface LiveCurationProgress {
   write_error_count: number;
 }
 
+export interface LiveChunkProcessingTimings {
+  upload_ms: number;
+  provider_ms: number;
+  normalization_ms: number;
+  collection_ms: number;
+  total_ms: number;
+}
+
 export interface LiveChunkAnalysisResponse {
   sequence_id: number;
   window_start_sec: number;
   window_end_sec: number;
   sound_events: SoundEvent[];
   processing_time_ms: number;
+  timings?: LiveChunkProcessingTimings | null;
   collection_status?: LiveChunkCollectionStatus | null;
   curation_progress?: LiveCurationProgress | null;
 }

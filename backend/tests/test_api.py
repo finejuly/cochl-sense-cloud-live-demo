@@ -543,6 +543,16 @@ def test_live_collection_failure_preserves_analysis_and_removes_staged_audio(
     ]
     assert response.json()["collection_status"] is None
     assert response.json()["curation_progress"] is None
+    timings = response.json()["timings"]
+    assert set(timings) == {
+        "upload_ms",
+        "provider_ms",
+        "normalization_ms",
+        "collection_ms",
+        "total_ms",
+    }
+    assert all(isinstance(value, int) and value >= 0 for value in timings.values())
+    assert timings["total_ms"] >= response.json()["processing_time_ms"]
     assert not any(recordings_dir.rglob("*.wav"))
 
 

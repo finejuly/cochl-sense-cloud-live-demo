@@ -89,6 +89,7 @@ from backend.app.models import (
     DeletionResponse,
     GcsSessionUploadResponse,
     LiveChunkAnalysisResponse,
+    LiveChunkProcessingTimings,
     LiveCurationProgress,
     LiveSessionEndResponse,
     ReadinessResponse,
@@ -601,14 +602,19 @@ async def analyze_live_chunk(
             window_start_sec,
             window_end_sec,
         )
+        upload_finished_at = perf_counter()
         provider = _provider(request.app, settings)
         raw_result = await _analyze_live_chunk_with_provider(
             request.app,
             provider,
             saved_path,
         )
-        processing_time_ms = int((perf_counter() - started_at) * 1000)
+        provider_finished_at = perf_counter()
+        # Preserve the existing field's meaning for API compatibility: upload
+        # plus provider work, before normalization and local collection.
+        processing_time_ms = int((provider_finished_at - started_at) * 1000)
         sound_events = normalize_sound_events(raw_result, offset_sec=window_start_sec)
+        normalization_finished_at = perf_counter()
         collection_status = None
         curation_progress = None
         if settings.collection_enabled:
@@ -632,12 +638,26 @@ async def analyze_live_chunk(
                 live_file_handled = True
         else:
             schedule_live_chunk_conversion(request.app, saved_path)
+        collection_finished_at = perf_counter()
         return LiveChunkAnalysisResponse(
             sequence_id=sequence_id,
             window_start_sec=window_start_sec,
             window_end_sec=window_end_sec,
             sound_events=sound_events,
             processing_time_ms=processing_time_ms,
+            timings=LiveChunkProcessingTimings(
+                upload_ms=int((upload_finished_at - started_at) * 1000),
+                provider_ms=int(
+                    (provider_finished_at - upload_finished_at) * 1000
+                ),
+                normalization_ms=int(
+                    (normalization_finished_at - provider_finished_at) * 1000
+                ),
+                collection_ms=int(
+                    (collection_finished_at - normalization_finished_at) * 1000
+                ),
+                total_ms=int((collection_finished_at - started_at) * 1000),
+            ),
             collection_status=collection_status,
             curation_progress=curation_progress,
         )
