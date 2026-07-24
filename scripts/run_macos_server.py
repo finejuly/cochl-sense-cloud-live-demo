@@ -54,7 +54,11 @@ def _probe_readiness(port: int) -> tuple[bool, str, bool]:
     """
     url = f"http://{HOST}:{port}/api/ready"
     try:
-        with urlopen(url, timeout=0.25) as response:
+        # The URL is built from the fixed loopback HOST constant.
+        with urlopen(  # nosec B310
+            url,
+            timeout=0.25,
+        ) as response:
             payload = response.read().decode("utf-8", errors="replace")
             if response.status == 200:
                 return True, "ready", False

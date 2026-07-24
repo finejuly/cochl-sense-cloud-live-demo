@@ -43,6 +43,11 @@ class ProbeRow:
     window_end_delay_ms: int | None = None
     request_ms: int | None = None
     backend_ms: int | None = None
+    backend_upload_ms: int | None = None
+    backend_provider_ms: int | None = None
+    backend_normalization_ms: int | None = None
+    backend_collection_ms: int | None = None
+    backend_total_ms: int | None = None
     submit_ms: int | None = None
     result_wait_ms: int | None = None
     in_flight_at_dispatch: int | None = None
@@ -327,8 +332,8 @@ class LocalApiRunner(ProbeRunner):
     def __init__(self, audio_path: Path, url: str, timeout: float):
         self.audio_path = audio_path
         self.audio_bytes = audio_path.read_bytes()
-        self.url = url
-        self.end_url = live_session_end_url(url)
+        self.url = validated_http_url(url)
+        self.end_url = live_session_end_url(self.url)
         self.timeout = timeout
 
     def send(
@@ -382,7 +387,11 @@ class LocalApiRunner(ProbeRunner):
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            # LocalApiRunner validates the URL at initialization.
+            with urllib.request.urlopen(  # nosec B310
+                request,
+                timeout=self.timeout,
+            ) as response:
                 payload = response.read()
                 row.status_code = response.status
 
@@ -396,6 +405,15 @@ class LocalApiRunner(ProbeRunner):
             data = json.loads(payload.decode("utf-8"))
             row.status = "OK"
             row.backend_ms = maybe_int(data.get("processing_time_ms"))
+            timings = data.get("timings")
+            if isinstance(timings, dict):
+                row.backend_upload_ms = maybe_int(timings.get("upload_ms"))
+                row.backend_provider_ms = maybe_int(timings.get("provider_ms"))
+                row.backend_normalization_ms = maybe_int(
+                    timings.get("normalization_ms")
+                )
+                row.backend_collection_ms = maybe_int(timings.get("collection_ms"))
+                row.backend_total_ms = maybe_int(timings.get("total_ms"))
             labels = labels_from_local_response(data)
             row.event_count = len(labels)
             row.detected_labels = "; ".join(labels)
@@ -426,7 +444,11 @@ class LocalApiRunner(ProbeRunner):
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        # LocalApiRunner validates the URL at initialization.
+        with urllib.request.urlopen(  # nosec B310
+            request,
+            timeout=self.timeout,
+        ) as response:
             response.read()
             if response.status < 200 or response.status >= 300:
                 raise RuntimeError(
@@ -441,6 +463,20 @@ def live_session_end_url(analyze_url: str) -> str:
     return urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, end_path, "", "")
     )
+
+
+def validated_http_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError(
+            "Local API URL must use HTTP(S), include a host, and omit credentials."
+        )
+    return url
 
 
 def multipart_body(
@@ -578,10 +614,16 @@ def write_csv(path: Path, rows: list[ProbeRow]) -> None:
 def print_row(row: ProbeRow) -> None:
     if row.status == "OK":
         backend = f" backend={row.backend_ms}ms" if row.backend_ms is not None else ""
+        backend_total = (
+            f" backend_total={row.backend_total_ms}ms"
+            if row.backend_total_ms is not None
+            else ""
+        )
         submit = f" submit={row.submit_ms}ms wait={row.result_wait_ms}ms" if row.submit_ms is not None else ""
         print(
             f"{row.sequence_id:04d} {row.phase.upper()} OK "
-            f"window_end={row.window_end_delay_ms}ms request={row.request_ms}ms{backend}{submit} "
+            f"window_end={row.window_end_delay_ms}ms request={row.request_ms}ms"
+            f"{backend}{backend_total}{submit} "
             f"in_flight={row.in_flight_at_dispatch} events={row.event_count}"
         )
     elif row.status == "SKIP":
@@ -615,6 +657,15 @@ def print_summary(rows: list[ProbeRow]) -> None:
     )
     print_latency_stats("request_ms", [row.request_ms for row in ok_rows])
     print_latency_stats("backend_ms", [row.backend_ms for row in ok_rows])
+    print_latency_stats(
+        "backend_provider_ms", [row.backend_provider_ms for row in ok_rows]
+    )
+    print_latency_stats(
+        "backend_collection_ms", [row.backend_collection_ms for row in ok_rows]
+    )
+    print_latency_stats(
+        "backend_total_ms", [row.backend_total_ms for row in ok_rows]
+    )
     print_latency_stats("submit_ms", [row.submit_ms for row in ok_rows])
     print_latency_stats("result_wait_ms", [row.result_wait_ms for row in ok_rows])
 

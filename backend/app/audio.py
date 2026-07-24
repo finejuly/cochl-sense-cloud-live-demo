@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
+# ffmpeg is invoked below without a shell from a resolved executable path.
+import subprocess  # nosec B404
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -77,6 +78,34 @@ def find_ffmpeg_executable() -> str | None:
     return None
 
 
+def _run_ffmpeg(
+    arguments: list[str],
+    *,
+    timeout_sec: int,
+    unavailable_message: str,
+    failure_message: str,
+) -> None:
+    ffmpeg = find_ffmpeg_executable()
+    if not ffmpeg:
+        raise AudioConversionError(unavailable_message)
+
+    try:
+        # No shell is used, and the executable is resolved from trusted paths.
+        subprocess.run(  # nosec B603
+            [ffmpeg, "-nostdin", "-y", *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        raise AudioConversionError(failure_message) from exc
+
+
 def normalized_content_type(content_type: str | None) -> str:
     if not content_type:
         return "application/octet-stream"
@@ -145,71 +174,43 @@ def prepare_live_audio_for_cochl(source_path: Path) -> PreparedAudio:
 
 
 def convert_to_wav(input_path: Path, output_path: Path) -> None:
-    ffmpeg = find_ffmpeg_executable()
-    if not ffmpeg:
-        raise AudioConversionError(
+    _run_ffmpeg(
+        [
+            "-i",
+            str(input_path),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            str(output_path),
+        ],
+        timeout_sec=FFMPEG_TIMEOUT_SEC,
+        unavailable_message=(
             "ffmpeg is required to convert this browser recording format to WAV."
-        )
-
-    try:
-        subprocess.run(
-            [
-                ffmpeg,
-                "-nostdin",
-                "-y",
-                "-i",
-                str(input_path),
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                str(output_path),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=FFMPEG_TIMEOUT_SEC,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise AudioConversionError("Failed to convert recording to WAV.") from exc
+        ),
+        failure_message="Failed to convert recording to WAV.",
+    )
 
 
 def convert_live_to_ogg(input_path: Path, output_path: Path) -> None:
-    ffmpeg = find_ffmpeg_executable()
-    if not ffmpeg:
-        raise AudioConversionError(
+    _run_ffmpeg(
+        [
+            "-i",
+            str(input_path),
+            "-ac",
+            "1",
+            "-c:a",
+            "libvorbis",
+            "-q:a",
+            str(LIVE_PROVIDER_VORBIS_QUALITY),
+            str(output_path),
+        ],
+        timeout_sec=LIVE_FFMPEG_TIMEOUT_SEC,
+        unavailable_message=(
             "ffmpeg is unavailable; live analysis will use the original WAV."
-        )
-
-    try:
-        subprocess.run(
-            [
-                ffmpeg,
-                "-nostdin",
-                "-y",
-                "-i",
-                str(input_path),
-                "-ac",
-                "1",
-                "-c:a",
-                "libvorbis",
-                "-q:a",
-                str(LIVE_PROVIDER_VORBIS_QUALITY),
-                str(output_path),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=LIVE_FFMPEG_TIMEOUT_SEC,
-        )
-    except (
-        OSError,
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-    ) as exc:
-        raise AudioConversionError(
-            "Failed to create the optimized live-analysis transport."
-        ) from exc
+        ),
+        failure_message="Failed to create the optimized live-analysis transport.",
+    )
 
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise AudioConversionError(
@@ -218,30 +219,19 @@ def convert_live_to_ogg(input_path: Path, output_path: Path) -> None:
 
 
 def convert_to_mp3(input_path: Path, output_path: Path) -> None:
-    ffmpeg = find_ffmpeg_executable()
-    if not ffmpeg:
-        raise AudioConversionError("ffmpeg is required to convert recording to MP3.")
-
-    try:
-        subprocess.run(
-            [
-                ffmpeg,
-                "-nostdin",
-                "-y",
-                "-i",
-                str(input_path),
-                "-ar",
-                "44100",
-                "-ac",
-                "1",
-                "-b:a",
-                "128k",
-                str(output_path),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=FFMPEG_TIMEOUT_SEC,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise AudioConversionError("Failed to convert recording to MP3.") from exc
+    _run_ffmpeg(
+        [
+            "-i",
+            str(input_path),
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            "-b:a",
+            "128k",
+            str(output_path),
+        ],
+        timeout_sec=FFMPEG_TIMEOUT_SEC,
+        unavailable_message="ffmpeg is required to convert recording to MP3.",
+        failure_message="Failed to convert recording to MP3.",
+    )

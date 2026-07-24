@@ -1155,22 +1155,23 @@ describe('App', () => {
       await userEvent.click(marker);
       expect(marker).toHaveAttribute('aria-pressed', 'true');
       expect(screen.getByText('Cough 00:00-00:00 93%', { selector: '.live-marker-detail' })).toBeInTheDocument();
-      expect(await screen.findByRole('img', { name: /청크 #1.*DETECTED.*요청 1\.35초.*서버 0\.90초.*윈도우 종료 후 1\.40초/i })).toBeInTheDocument();
+      expect(await screen.findByRole('img', { name: /청크 #1.*DETECTED.*요청 1\.35초.*서버 0\.90초.*윈도우 종료 후 1\.35초/i })).toBeInTheDocument();
       expect(await screen.findAllByText('Cough 93%')).not.toHaveLength(0);
       const latency = await screen.findByLabelText(/최근 실시간 감지 지연/i);
-      expect(latency).toHaveTextContent('최근 API 요청: 1.35초 · Cough 감지까지 2.90초');
+      expect(latency).toHaveTextContent('최근 API 요청: 1.35초 · Cough 감지까지 2.85초');
       expect(latency).toHaveAttribute(
         'title',
-        expect.stringContaining('윈도우 종료->마커 1.40초'),
+        expect.stringContaining('윈도우 종료(콜백 기준)->마커 1.35초'),
       );
       expect(infoSpy).toHaveBeenCalledWith(
         '[Cochl.Sense Cloud Live Demo latency]',
         expect.objectContaining({
           backendMs: 900,
-          eventDelayMs: 2900,
+          captureClockDriftMs: 50,
+          eventDelayMs: 2850,
           requestMs: 1350,
           windowCallbackDelayMs: 1350,
-          windowEndDelayMs: 1400,
+          windowEndDelayMs: 1350,
         }),
       );
     } finally {
@@ -1200,7 +1201,7 @@ describe('App', () => {
         request.resolve(liveResponse(1, []));
       });
 
-      expect(await screen.findByRole('img', { name: /청크 #1.*EMPTY.*윈도우 종료 후 4\.30초/i })).toBeInTheDocument();
+      expect(await screen.findByRole('img', { name: /청크 #1.*EMPTY.*윈도우 종료 후 4\.25초/i })).toBeInTheDocument();
       const lane = screen.getByLabelText(/실시간 청크 요청 상태/i);
       expect(within(lane).getByText('1s')).toBeInTheDocument();
       expect(within(lane).getByText('2s')).toBeInTheDocument();
@@ -1482,6 +1483,49 @@ describe('App', () => {
       expect(lines).toHaveLength(3);
       expect(lines[1]).toContain(',1,DETECTED,0,2,');
       expect(lines[2]).toContain(',2,EMPTY,1,3,');
+    } finally {
+      recording.restore();
+    }
+  });
+
+  it('keeps the full session in diagnostic CSV after old rows leave the UI history', async () => {
+    const recording = installRecordingEnvironment();
+    let capturedBlob: Blob | null = null;
+    vi.spyOn(URL, 'createObjectURL').mockImplementation((blob) => {
+      if (blob instanceof Blob) {
+        capturedBlob = blob;
+      }
+      return 'blob:full-session-live-chunks';
+    });
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    appMocks.analyzeLiveChunk.mockImplementation(async (input) => liveResponse(input.sequenceId, []));
+
+    try {
+      render(<App />);
+      await userEvent.click(screen.getByRole('button', { name: /녹음 시작/i }));
+      await screen.findByText(/녹음 중/i);
+
+      await act(async () => {
+        appMocks.liveWindowCallbacks[0](liveWindow(0, 2));
+      });
+      expect(await screen.findByRole('img', { name: /청크 #1.*EMPTY/i })).toBeInTheDocument();
+
+      await act(async () => {
+        appMocks.liveWindowCallbacks[0](liveWindow(4000, 4002));
+      });
+      expect(await screen.findByRole('img', { name: /청크 #2.*EMPTY/i })).toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole('button', { name: /완료/i }));
+      await userEvent.click(await screen.findByRole('button', { name: /CSV 다운로드/i }));
+
+      if (!capturedBlob) {
+        throw new Error('Expected CSV blob');
+      }
+      const lines = (await blobText(capturedBlob)).split('\n');
+      expect(lines).toHaveLength(3);
+      expect(lines[1]).toContain(',1,EMPTY,0,2,');
+      expect(lines[2]).toContain(',2,EMPTY,4000,4002,');
     } finally {
       recording.restore();
     }

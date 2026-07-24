@@ -10,10 +10,19 @@ export interface LiveChunkRecord {
   recordingStartedAtMs: number;
   windowStartSec: number;
   windowEndSec: number;
+  windowEmittedAtMs: number;
+  captureClockDriftMs: number;
+  inFlightAtDispatch: number;
   requestStartedAtMs: number | null;
   responseReceivedAtMs: number | null;
+  encodeMs: number | null;
   requestMs: number | null;
   backendMs: number | null;
+  backendUploadMs: number | null;
+  backendProviderMs: number | null;
+  backendNormalizationMs: number | null;
+  backendCollectionMs: number | null;
+  backendTotalMs: number | null;
   windowEndDelayMs: number | null;
   eventCount: number;
   detectedLabels: string[];
@@ -45,16 +54,25 @@ interface LiveChunkRecordInput {
   recordingStartedAtMs: number;
   windowStartSec: number;
   windowEndSec: number;
+  windowEmittedAtMs: number;
+  inFlightAtDispatch: number;
 }
 
 export function createPendingLiveChunkRecord(input: LiveChunkRecordInput): LiveChunkRecord {
   return {
     ...input,
     status: 'PENDING',
+    captureClockDriftMs: captureClockDriftMs(input),
     requestStartedAtMs: null,
     responseReceivedAtMs: null,
+    encodeMs: null,
     requestMs: null,
     backendMs: null,
+    backendUploadMs: null,
+    backendProviderMs: null,
+    backendNormalizationMs: null,
+    backendCollectionMs: null,
+    backendTotalMs: null,
     windowEndDelayMs: null,
     eventCount: 0,
     detectedLabels: [],
@@ -69,6 +87,7 @@ export function markLiveChunkRequestStarted(
   return {
     ...record,
     requestStartedAtMs,
+    encodeMs: positiveRoundedMs(requestStartedAtMs - record.windowEmittedAtMs),
   };
 }
 
@@ -76,10 +95,17 @@ export function createSkippedLiveChunkRecord(input: LiveChunkRecordInput): LiveC
   return {
     ...input,
     status: 'SKIP',
+    captureClockDriftMs: captureClockDriftMs(input),
     requestStartedAtMs: null,
     responseReceivedAtMs: null,
+    encodeMs: null,
     requestMs: null,
     backendMs: null,
+    backendUploadMs: null,
+    backendProviderMs: null,
+    backendNormalizationMs: null,
+    backendCollectionMs: null,
+    backendTotalMs: null,
     windowEndDelayMs: null,
     eventCount: 0,
     detectedLabels: [],
@@ -95,6 +121,7 @@ export function completeLiveChunkRecord(
 ): LiveChunkRecord {
   const detectedEvents = response.sound_events.filter((event) => isDetectedEvent(event, threshold));
   const status: LiveChunkStatus = detectedEvents.length ? 'DETECTED' : 'EMPTY';
+  const timings = response.timings;
 
   return {
     ...record,
@@ -102,6 +129,11 @@ export function completeLiveChunkRecord(
     responseReceivedAtMs,
     requestMs: requestMs(record, responseReceivedAtMs),
     backendMs: positiveRoundedMs(response.processing_time_ms),
+    backendUploadMs: optionalRoundedMs(timings?.upload_ms),
+    backendProviderMs: optionalRoundedMs(timings?.provider_ms),
+    backendNormalizationMs: optionalRoundedMs(timings?.normalization_ms),
+    backendCollectionMs: optionalRoundedMs(timings?.collection_ms),
+    backendTotalMs: optionalRoundedMs(timings?.total_ms),
     windowEndDelayMs: windowEndDelayMs(record, responseReceivedAtMs),
     eventCount: detectedEvents.length,
     detectedLabels: detectedEvents.map(formatDetectedLabel),
@@ -120,6 +152,11 @@ export function failLiveChunkRecord(
     responseReceivedAtMs,
     requestMs: requestMs(record, responseReceivedAtMs),
     backendMs: null,
+    backendUploadMs: null,
+    backendProviderMs: null,
+    backendNormalizationMs: null,
+    backendCollectionMs: null,
+    backendTotalMs: null,
     windowEndDelayMs: windowEndDelayMs(record, responseReceivedAtMs),
     eventCount: 0,
     detectedLabels: [],
@@ -224,10 +261,19 @@ export function liveChunkRecordsToCsv(records: LiveChunkRecord[], nowMs: number)
     'status',
     'window_start_sec',
     'window_end_sec',
+    'window_emitted_at_iso',
+    'capture_clock_drift_ms',
+    'in_flight_at_dispatch',
     'request_started_at_iso',
     'response_received_at_iso',
+    'encode_ms',
     'request_ms',
     'backend_ms',
+    'backend_upload_ms',
+    'backend_provider_ms',
+    'backend_normalization_ms',
+    'backend_collection_ms',
+    'backend_total_ms',
     'window_end_delay_ms',
     'event_count',
     'detected_labels',
@@ -240,10 +286,19 @@ export function liveChunkRecordsToCsv(records: LiveChunkRecord[], nowMs: number)
     record.status,
     formatNumber(record.windowStartSec),
     formatNumber(record.windowEndSec),
+    new Date(record.windowEmittedAtMs).toISOString(),
+    record.captureClockDriftMs,
+    record.inFlightAtDispatch,
     record.requestStartedAtMs === null ? '' : new Date(record.requestStartedAtMs).toISOString(),
     record.responseReceivedAtMs === null ? '' : new Date(record.responseReceivedAtMs).toISOString(),
+    csvResolvedMs(record, record.encodeMs),
     csvRequestMs(record),
     csvBackendMs(record),
+    csvResolvedMs(record, record.backendUploadMs),
+    csvResolvedMs(record, record.backendProviderMs),
+    csvResolvedMs(record, record.backendNormalizationMs),
+    csvResolvedMs(record, record.backendCollectionMs),
+    csvResolvedMs(record, record.backendTotalMs),
     csvWindowEndDelayMs(record, nowMs),
     record.eventCount,
     record.detectedLabels.join('; '),
@@ -275,11 +330,20 @@ function requestMs(record: LiveChunkRecord, responseReceivedAtMs: number): numbe
 }
 
 function windowEndDelayMs(record: LiveChunkRecord, snapshotMs: number): number {
-  return positiveRoundedMs(snapshotMs - windowEndMs(record));
+  // Audio sample time and the system wall clock drift independently over long
+  // sessions. Anchor response delay to this window's actual callback instead
+  // of projecting every window from the one recording-start wall-clock value.
+  return positiveRoundedMs(snapshotMs - record.windowEmittedAtMs);
 }
 
-function windowEndMs(record: LiveChunkRecord): number {
+function windowEndMs(
+  record: Pick<LiveChunkRecord, 'recordingStartedAtMs' | 'windowEndSec'>,
+): number {
   return record.recordingStartedAtMs + record.windowEndSec * 1000;
+}
+
+function captureClockDriftMs(record: LiveChunkRecordInput): number {
+  return Math.round(record.windowEmittedAtMs - windowEndMs(record));
 }
 
 function tailEndSecForRecord(record: LiveChunkRecord, nowMs: number): number | null {
@@ -292,7 +356,7 @@ function tailEndSecForRecord(record: LiveChunkRecord, nowMs: number): number | n
   if (snapshotMs === null) {
     return null;
   }
-  return Math.max(0, (snapshotMs - record.recordingStartedAtMs) / 1000);
+  return record.windowEndSec + Math.max(0, snapshotMs - record.windowEmittedAtMs) / 1000;
 }
 
 function delayTicksForRecord(
@@ -360,6 +424,13 @@ function csvBackendMs(record: LiveChunkRecord): string {
   return String(record.backendMs);
 }
 
+function csvResolvedMs(record: LiveChunkRecord, value: number | null): string {
+  if (record.status === 'PENDING' || record.status === 'SKIP' || value === null) {
+    return '';
+  }
+  return String(value);
+}
+
 function csvWindowEndDelayMs(record: LiveChunkRecord, nowMs: number): string {
   if (record.status === 'SKIP') {
     return '';
@@ -386,8 +457,14 @@ function chunkDescription(record: LiveChunkRecord, nowMs: number): string {
   if (record.backendMs !== null) {
     details.push(`서버 ${formatLatency(record.backendMs)}`);
   }
+  if (record.backendTotalMs !== null && record.backendTotalMs !== record.backendMs) {
+    details.push(`서버 전체 ${formatLatency(record.backendTotalMs)}`);
+  }
   if (currentWindowEndDelayMs !== null) {
     details.push(`윈도우 종료 후 ${formatLatency(currentWindowEndDelayMs)}`);
+  }
+  if (Math.abs(record.captureClockDriftMs) >= 100) {
+    details.push(`캡처 시계 차이 ${formatSignedLatency(record.captureClockDriftMs)}`);
   }
   if (record.detectedLabels.length) {
     details.push(record.detectedLabels.join(', '));
@@ -418,12 +495,23 @@ function positiveRoundedMs(value: number): number {
   return Math.max(0, Math.round(value));
 }
 
+function optionalRoundedMs(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? positiveRoundedMs(value)
+    : null;
+}
+
 function formatSeconds(value: number): string {
   return `${formatNumber(value)}s`;
 }
 
 function formatLatency(milliseconds: number): string {
   return `${(milliseconds / 1000).toFixed(2)}초`;
+}
+
+function formatSignedLatency(milliseconds: number): string {
+  const sign = milliseconds >= 0 ? '+' : '-';
+  return `${sign}${formatLatency(Math.abs(milliseconds))}`;
 }
 
 function formatNumber(value: number): string {

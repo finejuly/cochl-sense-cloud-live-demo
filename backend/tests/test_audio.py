@@ -227,3 +227,21 @@ def test_convert_to_mp3_uses_44100_hz_mono_128_kbps(tmp_path, monkeypatch):
             {"check": True, "capture_output": True, "text": True, "timeout": 120},
         )
     ]
+
+
+def test_convert_to_mp3_wraps_ffmpeg_os_errors(tmp_path, monkeypatch):
+    source = tmp_path / "clip.wav"
+    output = tmp_path / "clip.mp3"
+    monkeypatch.setattr("backend.app.audio.shutil.which", lambda name: "/usr/bin/ffmpeg")
+
+    def fail_to_start(*args, **kwargs):
+        raise OSError("ffmpeg disappeared")
+
+    monkeypatch.setattr("backend.app.audio.subprocess.run", fail_to_start)
+
+    try:
+        convert_to_mp3(source, output)
+    except AudioConversionError as exc:
+        assert str(exc) == "Failed to convert recording to MP3."
+    else:
+        raise AssertionError("Expected ffmpeg startup failure to be normalized")

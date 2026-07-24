@@ -414,7 +414,7 @@ def test_completed_stream_passes_socket_timeout_and_requires_completion(monkeypa
     class FakeApi:
         @staticmethod
         def create_event_stream_request(job_id):
-            return f"request:{job_id}"
+            return f"https://example.invalid/results/{job_id}"
 
     class FakeResponse:
         def __enter__(self):
@@ -437,4 +437,17 @@ def test_completed_stream_passes_socket_timeout_and_requires_completion(monkeypa
     result = _get_completed_result_with_socket_timeout(FakeApi(), "job-1", 4.0)
 
     assert result == {"sound_event_detection": {"results": []}}
-    assert captured == {"request": "request:job-1", "timeout": 4.0}
+    assert captured == {
+        "request": "https://example.invalid/results/job-1",
+        "timeout": 4.0,
+    }
+
+
+def test_completed_stream_rejects_non_https_url():
+    class FakeApi:
+        @staticmethod
+        def create_event_stream_request(job_id):
+            return f"file:///tmp/{job_id}"
+
+    with pytest.raises(RuntimeError, match="must use HTTPS"):
+        _get_completed_result_with_socket_timeout(FakeApi(), "job-1", 4.0)

@@ -14,7 +14,7 @@ Backend setup (run from repo root; note the specific interpreter and editable in
 
 ```bash
 /opt/homebrew/bin/python3.11 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install --upgrade pip "setuptools>=83.0.0"
 .venv/bin/python -m pip install -c backend/constraints.txt -e "backend[dev]"
 cp .env.example .env   # then set COCHL_PROJECT_KEY
 ```
@@ -22,7 +22,7 @@ cp .env.example .env   # then set COCHL_PROJECT_KEY
 Run locally (two processes):
 
 ```bash
-.venv/bin/uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+.venv/bin/python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 cd frontend && nvm use && npm install && npm run dev   # Vite proxies /api -> :8000
 ```
 
@@ -98,7 +98,7 @@ By default (`COCHL_COLLECTION_ENABLED=true`), analyzed live chunks flow into `co
 - `config.py` — frozen `Settings` dataclass loaded from env via `Settings.from_env()`. `get_settings()` in `main.py` is `lru_cache`d, so **env changes require a process restart**. `validate_service_combination` enforces that audio insights requires both SED and speech analysis.
 - `normalization.py` — defensively maps Cochl's raw (and variably-keyed) JSON into the typed response models. It tolerates alternate field names (`start_time_sec`/`start`, `class`/`label`/`name`, etc.) via `_first_present` — preserve this leniency when editing.
 - `audio.py` — content-type/extension mapping, upload size validation, Finder-safe `ffmpeg` discovery, and WAV/MP3/Ogg conversion. Live provider transport may use a temporary sample-rate-preserving mono Ogg while the original collected 48 kHz WAV remains unchanged; unsupported standalone full-recording uploads are converted to 16 kHz mono WAV for Cochl; collected MP3 output is 44.1 kHz mono at 128 kbps. Missing `ffmpeg` raises `AudioConversionError` where conversion is required and makes the live provider path fall back to its original WAV.
-- `models.py` — Pydantic response models (`AnalysisResponse`, `LiveChunkAnalysisResponse`, `SoundEvent`, etc.).
+- `models.py` — Pydantic response models (`AnalysisResponse`, `LiveChunkAnalysisResponse`, `SoundEvent`, etc.). Every successful live response includes upload/provider/normalization/collection/total stage timings in addition to the legacy `processing_time_ms` field.
 
 The dashboard never creates a full-session recording. Explicit standalone uploads to `/api/analyze-recording` persist under `recordings/`. With collection enabled (default), meaningful live audio ends up in `recordings/collected/<session-id>/` and discarded chunks are deleted; with it disabled, every live chunk is kept under `recordings/live/<session-id>/` as MP3. Nothing else is auto-deleted.
 
@@ -106,8 +106,8 @@ The dashboard never creates a full-session recording. Explicit standalone upload
 
 `App.tsx` is the large orchestrator; most logic lives in small, individually-tested pure modules:
 
-- `liveAudio.ts` — `LiveWindowBuffer` slices the mic stream into overlapping windows; `createLiveAudioCapture` wires the Web Audio graph, records the actual graph-start wall time used by post-window latency, enforces the requested 48 kHz processing rate, and emits both analysis windows and visualization-only mel-spectrogram frames (2,048-point FFT, 64 bands from 50 Hz–16 kHz, fixed −95 to −25 dB normalization); `encodePcm16Wav` builds the unchanged 16-bit mono WAV blob sent to the backend.
-- `liveChunkRecords.ts` — the per-chunk state machine. Each chunk is `PENDING | DETECTED | EMPTY | FAIL | SKIP` and carries latency fields; also derives the render geometry for the chunk timeline. The dashboard retains 60 minutes of completed rows and never evicts `PENDING` rows.
+- `liveAudio.ts` — `LiveWindowBuffer` slices the mic stream into overlapping windows; `createLiveAudioCapture` wires the Web Audio graph, records the actual graph-start wall time used only to diagnose capture-clock drift, enforces the requested 48 kHz processing rate, and emits both analysis windows and visualization-only mel-spectrogram frames (2,048-point FFT, 64 bands from 50 Hz–16 kHz, fixed −95 to −25 dB normalization); `encodePcm16Wav` builds the unchanged 16-bit mono WAV blob sent to the backend.
+- `liveChunkRecords.ts` — the per-chunk state machine. Each chunk is `PENDING | DETECTED | EMPTY | FAIL | SKIP` and carries latency fields; also derives the render geometry for the chunk timeline. Response tails use each window's actual emission callback as their zero point so audio-device/system-clock drift cannot accumulate into apparent API latency. The dashboard retains 60 minutes of completed rows and never evicts `PENDING` rows, while `App.tsx` keeps one compact non-rendered record per sequence in a map so the post-session diagnostic CSV covers the entire session.
 - `liveTimeline.ts` — merges/lays out detected events into lanes, manages the scrolling viewport, and limits display-only event history to the same 60-minute window. This pruning never affects backend collection.
 - `api.ts` — dashboard fetch calls (`analyzeLiveChunk`, `endLiveSession`, collected-session list/delete/file-URL helpers); error bodies are read from `{ detail }`. **User-facing strings are Korean** — match that when adding UI copy.
 - `CollectedSessionsPanel.tsx` — self-contained 수집된 데이터 management panel (list, inline audio playback, confirm-guarded deletes). It refetches whenever the `refreshToken` prop changes; `App.tsx` bumps it after each session end and deliberately does not enable periodic full-list polling while recording. Expanded long sessions render the newest 100 segment rows first and reveal older rows in 100-item pages.

@@ -65,12 +65,21 @@ class LiveCurationProgress(BaseModel):
     write_error_count: int = 0
 
 
+class LiveChunkProcessingTimings(BaseModel):
+    upload_ms: int
+    provider_ms: int
+    normalization_ms: int
+    collection_ms: int
+    total_ms: int
+
+
 class LiveChunkAnalysisResponse(BaseModel):
     sequence_id: int
     window_start_sec: float
     window_end_sec: float
     sound_events: list[SoundEvent] = Field(default_factory=list)
     processing_time_ms: int
+    timings: LiveChunkProcessingTimings
     collection_status: LiveChunkCollectionStatus | None = None
     curation_progress: LiveCurationProgress | None = None
 
